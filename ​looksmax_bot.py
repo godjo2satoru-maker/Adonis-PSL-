@@ -1571,7 +1571,26 @@ def is_channel_bonus_claimed(user_id):
         c = conn.cursor()
         c.execute("SELECT COALESCE(channel_bonus_claimed, 0) FROM users WHERE user_id = ?", (user_id,))
         row = c.fetchone()
-        return bool(row and row[0])_mp_lock = threading.Lock()
+        return bool(row and row[0])
+
+
+def claim_channel_bonus(user_id):
+    ensure_user(user_id)
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            UPDATE users
+            SET channel_bonus_claimed = 1,
+                free_limit = free_limit + ?
+            WHERE user_id = ? AND COALESCE(channel_bonus_claimed, 0) = 0
+            """,
+            (CHANNEL_SUB_BONUS, user_id),
+        )
+        return c.rowcount > 0
+
+
+_mp_lock = threading.Lock()
 _mp_mode = None
 _mp_detector = None
 
@@ -1814,7 +1833,6 @@ def analyze_face_geometry(image_bytes):
         return None
     rpts, re_c, le_c, pose = aligned
 
-    # При сильном развороте головы (профиль/полупрофиль > 34°) 2D-метрики искажаются
     if abs(pose["yaw"]) > 34.0:
         return None
 
@@ -2682,8 +2700,6 @@ def render_profile_report_card(image_bytes, profile_data, bot_username=None):
     with io.BytesIO() as out_buf:
         canvas.convert("RGB").save(out_buf, format="JPEG", quality=92, subsampling=0)
         return out_buf.getvalue()
-
-
 STRICT_PARAM_RULES = [
     ("Глаза", [r"глаз"]),
     ("Брови", [r"бров"]),
@@ -3251,20 +3267,7 @@ def parse_profile_response(raw_response):
     return profile_data, part2
 
 
-def claim_channel_bonus(user_id):
-    ensure_user(user_id)
-    with db_conn() as conn:
-        c = conn.cursor()
-        c.execute(
-            """
-            UPDATE users
-            SET channel_bonus_claimed = 1,
-                free_limit = free_limit + ?
-            WHERE user_id = ? AND COALESCE(channel_bonus_claimed, 0) = 0
-            """,
-            (CHANNEL_SUB_BONUS, user_id),
-        )
-        return c.rowcount > 0_media_group_lock = threading.Lock()
+_media_group_lock = threading.Lock()
 _seen_media_groups = {}
 
 
