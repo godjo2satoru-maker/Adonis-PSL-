@@ -1014,6 +1014,9 @@ def apply_plan_to_user(user_id, plan_id):
             cursor.execute(
                 "UPDATE users SET free_limit = free_limit + ? WHERE user_id = ?",
                 (plan["amount"], user_id),
+            )
+
+
 def create_payment_request(user_id, plan_id, promo_code="", rub_amount=0):
     with db_conn() as conn:
         cursor = conn.cursor()
@@ -4416,6 +4419,13 @@ def _format_full_breakdown(full_text, geom=None):
                 lines.append(f"• {m['name']}: {m['status']} ({m['norm']})")
         lines.append(f"• Симметрия: {geom['symmetry_pct']:.1f}% — {geom['symmetry_status']}")
         if geom.get("face_shape"):
+            lines.append(f"• Форма лица: {geom['face_shape']}")
+        parts.append("\n".join(lines))
+    if full_text:
+        parts.append(full_text.strip())
+    return "\n\n".join(parts)
+
+
 def _send_no_scans_prompt(chat_id, user_id=None):
     markup = InlineKeyboardMarkup(row_width=1)
     markup.add(InlineKeyboardButton(f"🤝 Пригласить друга (+{REFERRAL_BONUS} скан)", callback_data="get_ref"))
