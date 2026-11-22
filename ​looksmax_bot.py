@@ -62,8 +62,15 @@ _load_dotenv()
 _ENV_KEYS = os.getenv("GEMINI_API_KEYS", "").strip()
 API_KEYS = [k.strip() for k in _ENV_KEYS.split(",") if k.strip()]
 
+GEMINI_BASE_URL = (
+    os.getenv("GEMINI_BASE_URL", "https://adonis-bot.godjo2satoru.workers.dev")
+    .strip()
+    .rstrip("/")
+)
+
 DEFAULT_MODELS = ["gemini-3.5-flash-lite"]
 PRESET_MODELS = [
+    "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
     "gemini-3.6-flash",
 ]
@@ -97,45 +104,11 @@ REFERRAL_BONUS = 1
 PRO30_DAILY_LIMIT = 15
 PRO_LIFE_DAILY_LIMIT = 20
 PRO30_DAYS = 30
-RECEIPT_WAIT_TTL = 600
+RECEIPT_WAIT_TTL = 1800
+PROFILE_WAIT_TTL = 1800
+
 PROFILE_WAIT_TTL = 600
-
-PLANS = {
-    "pack5": {
-        "title": "⚡ 5 сканов",
-        "desc": "Пакет из 5 сканов внешности (не сгорают)",
-        "stars": 30,
-        "rub": 50,
-        "type": "pack",
-        "amount": 5,
-    },
-    "pack15": {
-        "title": "🔥 15 сканов",
-        "desc": "Выгодный пакет из 15 сканов внешности (не сгорают)",
-        "stars": 70,
-        "rub": 129,
-        "type": "pack",
-        "amount": 15,
-    },
-    "pro30": {
-        "title": f"👑 PRO на {PRO30_DAYS} дней",
-        "desc": f"До {PRO30_DAILY_LIMIT} сканов/день, анализ профиля и приоритет в очереди на {PRO30_DAYS} дней",
-        "stars": 250,
-        "rub": 500,
-        "type": "pro30",
-        "amount": PRO30_DAYS,
-    },
-    "pro_life": {
-        "title": "💎 PRO Навсегда",
-        "desc": f"До {PRO_LIFE_DAILY_LIMIT} сканов/день, анализ профиля, топ-приоритет и все будущие функции",
-        "stars": 1000,
-        "rub": 2000,
-        "type": "pro_life",
-        "amount": 0,
-    },
-}
-
-CACHE_VERSION = "v12_weighted_psl"
+CACHE_VERSION = "v13_calibrated_mesh"
 PROFILE_CACHE_VERSION = "v3_profile_structural"
 MAX_IMAGE_FILE_SIZE = 15 * 1024 * 1024
 SCAN_WORKERS = 3
@@ -255,11 +228,36 @@ def set_awaiting_receipt(user_id, plan_id):
 
 
 def pop_awaiting_receipt(user_id):
+    """Возвращает (plan_id, expired): различает отсутствие ожидания и просрочку таймаута."""
     with _receipt_lock:
         item = _awaiting_receipt.pop(user_id, None)
-    if not item or (time.time() - item["ts"] > RECEIPT_WAIT_TTL):
-        return None
-    return item["plan_id"]
+    if not item:
+        return None, False
+    if time.time() - item["ts"] > RECEIPT_WAIT_TTL:
+        return None, True
+    return item["plan_id"], False
+
+
+def clear_awaiting_receipt(user_id):
+    with _receipt_lock:
+        return _awaiting_receipt.pop(user_id, None) is not None
+
+
+def set_awaiting_profile(user_id):
+    with _profile_lock:
+        _awaiting_profile[user_id] = time.time()
+
+
+def pop_awaiting_profile(user_id):
+    """Возвращает (is_active, expired): различает обычный режим и просрочку режима профиля."""
+    with _profile_lock:
+        ts = _awaiting_profile.pop(user_id, None)
+    if ts is None:
+        return False, False
+    if (time.time() - ts) > PROFILE_WAIT_TTL:
+        return False, True
+    return True, False
+
 
 
 def clear_awaiting_receipt(user_id):
@@ -385,6 +383,7 @@ def init_db():
                 scores_text TEXT,
                 full_text TEXT,
                 card_image BLOB DEFAULT NULL,
+                card_file_id TEXT DEFAULT '',
                 last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
@@ -526,32 +525,9 @@ def ensure_user_columns():
             cursor.execute(
                 "ALTER TABLE photo_cache ADD COLUMN card_image BLOB DEFAULT NULL"
             )
-
-
-def ensure_user(user_id, username="", first_name=""):
-    uname = (username or "").lstrip("@").lower()
-    fname = (first_name or "")[:64]
-    with db_conn() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT OR IGNORE INTO users (
-                user_id, username, first_name, free_limit, is_premium,
-                pro_tier, pro_until, is_adult, is_banned, referrals_count
-            )
-            VALUES (?, ?, ?, ?, 0, 0, 0, 0, 0, 0)
-            """,
-            (user_id, uname, fname, DEFAULT_FREE_LIMIT),
-        )
-        if uname or fname:
+        if "card_file_id" not in cache_cols:
             cursor.execute(
-                """
-                UPDATE users
-                SET username = CASE WHEN ? != '' THEN ? ELSE username END,
-                    first_name = CASE WHEN ? != '' THEN ? ELSE first_name END
-                WHERE user_id = ?
-                """,
-                (uname, uname, fname, fname, user_id),
+                "ALTER TABLE photo_cache ADD COLUMN card_file_id TEXT DEFAULT ''"
             )
 
 
@@ -863,6 +839,22 @@ def try_consume_scan(user_id):
         return cursor.rowcount > 0
 
 
+def try_consume_extra_scan(user_id):
+    """Списывает 1 скан из пакетного баланса (в том числе как резерв поверх дневного лимита PRO)."""
+    with db_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE users
+            SET free_limit = free_limit - 1
+            WHERE user_id = ?
+              AND free_limit > 0
+            """,
+            (user_id,),
+        )
+        return cursor.rowcount > 0
+
+
 def refund_scan(user_id):
     with db_conn() as conn:
         conn.cursor().execute(
@@ -909,7 +901,7 @@ def cache_get(photo_hash):
     with db_conn() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT scores_text, full_text, card_image FROM photo_cache WHERE photo_hash = ?",
+            "SELECT scores_text, full_text, card_image, COALESCE(card_file_id, '') FROM photo_cache WHERE photo_hash = ?",
             (photo_hash,),
         )
         row = cursor.fetchone()
@@ -919,20 +911,22 @@ def cache_get(photo_hash):
             "UPDATE photo_cache SET last_used = CURRENT_TIMESTAMP WHERE photo_hash = ?",
             (photo_hash,),
         )
-        return row[0], row[1], row[2]
+        return row[0], row[1], row[2], row[3]
 
 
-def cache_put(photo_hash, scores_text, full_text, card_image=None):
+def cache_put(photo_hash, scores_text, full_text, card_image=None, card_file_id=""):
+    """Сохраняет результат в кэш; при наличии Telegram file_id не раздувает БД хранением JPEG BLOB."""
+    stored_blob = None if card_file_id else card_image
     with db_conn() as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
             INSERT OR REPLACE INTO photo_cache (
-                photo_hash, scores_text, full_text, card_image, last_used
+                photo_hash, scores_text, full_text, card_image, card_file_id, last_used
             )
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             """,
-            (photo_hash, scores_text, full_text, card_image),
+            (photo_hash, scores_text, full_text, stored_blob, card_file_id or ""),
         )
         cursor.execute(
             """
@@ -1137,12 +1131,13 @@ def analyze_face_geometry(image_bytes):
 
     r_brow_low_y = (rpts[52][1] + rpts[65][1]) * 0.5
     l_brow_low_y = (rpts[282][1] + rpts[295][1]) * 0.5
-    brow_line_y = (r_brow_low_y + l_brow_low_y) * 0.5
+    upper_eyelid_y = (rpts[159][1] + rpts[386][1]) * 0.5
 
     midface_ratio = ipd / max(1.0, upper_lip_y - eye_line_y)
     s_mf, t_mf = _rate_range_metric(midface_ratio, 1.00, 1.10, 0.96, 1.14, 0.90, 1.18)
 
-    fwhr = bizygomatic / max(1.0, upper_lip_y - brow_line_y)
+    # FWHR по антропометрии (ширина скул / высота от линии верхнего века до верхней губы)
+    fwhr = bizygomatic / max(1.0, upper_lip_y - upper_eyelid_y)
     s_fwhr, t_fwhr = _rate_min_metric(fwhr, 1.90, 1.80, 1.70)
 
     r_tilt = math.degrees(math.atan2(rpts[133][1] - rpts[33][1], max(1.0, rpts[133][0] - rpts[33][0])))
@@ -1159,7 +1154,8 @@ def analyze_face_geometry(image_bytes):
     mid_to_lower = max(1.0, subnasale_y - glabella_y) / max(1.0, chin_y - subnasale_y)
     s_ml, t_ml = _rate_range_metric(mid_to_lower, 0.95, 1.05, 0.88, 1.12, 0.80, 1.20)
 
-    nose_w = abs(rpts[358][0] - rpts[129][0])
+    # Точки 48 и 278 соответствуют внешним краям крыльев носа (без захвата носогубной складки)
+    nose_w = abs(rpts[278][0] - rpts[48][0])
     nose_intercanthal = nose_w / max(1.0, abs(rpts[362][0] - rpts[133][0]))
     s_ni, t_ni = _rate_range_metric(nose_intercanthal, 0.95, 1.05, 0.87, 1.14, 0.78, 1.24)
 
@@ -1170,8 +1166,9 @@ def analyze_face_geometry(image_bytes):
     lip_fullness = max(1.0, lower_lip_y - upper_lip_y) / mouth_w
     s_lf, t_lf = _rate_range_metric(lip_fullness, 0.34, 0.44, 0.28, 0.49, 0.22, 0.55)
 
+    # Расстояние от складки верхнего века (27/257) до нижнего края брови (52,65 / 282,295)
     eye_w = max(1.0, (abs(rpts[133][0] - rpts[33][0]) + abs(rpts[263][0] - rpts[362][0])) * 0.5)
-    brow_to_eye = ((max(0.0, rpts[159][1] - r_brow_low_y) + max(0.0, rpts[386][1] - l_brow_low_y)) * 0.5) / eye_w
+    brow_to_eye = ((max(0.0, rpts[27][1] - r_brow_low_y) + max(0.0, rpts[257][1] - l_brow_low_y)) * 0.5) / eye_w
     s_be, t_be = _rate_range_metric(brow_to_eye, 0.16, 0.27, 0.12, 0.32, 0.08, 0.38)
 
     sym_pairs = [
@@ -1185,426 +1182,29 @@ def analyze_face_geometry(image_bytes):
         err_y = abs(rpts[li][1] - rpts[ri][1]) / bizygomatic
         errs.append(math.hypot(err_x, err_y))
 
-    symmetry_pct = max(70.0, min(99.5, 100.0 - (sum(errs) / len(errs)) * 210.0))
-    if symmetry_pct >= 94.0:
-        sym_status, sym_tone = "Идеал", "green"
-    elif symmetry_pct >= 89.0:
-        sym_status, sym_tone = "В норме", "green"
-    elif symmetry_pct >= 84.0:
-        sym_status, sym_tone = "Умеренная", "amber"
-    else:
-        sym_status, sym_tone = "Асимметрия", "red"
-
-    forehead_w = abs(rpts[284][0] - rpts[54][0])
-    jaw_w = abs(rpts[397][0] - rpts[172][0])
-    face_h = max(1.0, (chin_y - forehead_y) * 1.12)
-    face_shape = _classify_face_shape(forehead_w, bizygomatic, jaw_w, face_h)
-
-    xs = [p[0] for p in lms_norm]
-    ys = [p[1] for p in lms_norm]
-    face_bbox = (min(xs), min(ys), max(xs), max(ys))
-
-    metrics = [
-        {"name": "Midface ratio", "norm": "норма 1.00–1.10", "value": round(midface_ratio, 3), "display": f"{midface_ratio:.3f}", "status": s_mf, "tone": t_mf},
-        {"name": "FWHR", "norm": "норма от 1.90", "value": round(fwhr, 3), "display": f"{fwhr:.3f}", "status": s_fwhr, "tone": t_fwhr},
-        {"name": "Кантальный тилт", "norm": "норма 4–8°", "value": round(canthal_tilt, 1), "display": f"{canthal_tilt:+.1f}°", "status": s_ct, "tone": t_ct},
-        {"name": "ESR (глаза к лицу)", "norm": "норма 0.45–0.48", "value": round(esr, 3), "display": f"{esr:.3f}", "status": s_esr, "tone": t_esr},
-        {"name": "Подбородок к фильтруму", "norm": "норма 2.00–2.25", "value": round(chin_philtrum, 2), "display": f"{chin_philtrum:.2f}", "status": s_cp, "tone": t_cp},
-        {"name": "Средняя треть к нижней", "norm": "норма 0.95–1.05", "value": round(mid_to_lower, 3), "display": f"{mid_to_lower:.3f}", "status": s_ml, "tone": t_ml},
-        {"name": "Нос к межглазному", "norm": "норма 0.95–1.05", "value": round(nose_intercanthal, 3), "display": f"{nose_intercanthal:.3f}", "status": s_ni, "tone": t_ni},
-        {"name": "Нос к ширине рта", "norm": "норма 0.62–0.72", "value": round(nose_mouth, 3), "display": f"{nose_mouth:.3f}", "status": s_nm, "tone": t_nm},
-        {"name": "Полнота губ", "norm": "норма 0.34–0.44", "value": round(lip_fullness, 3), "display": f"{lip_fullness:.3f}", "status": s_lf, "tone": t_lf},
-        {"name": "Бровь к глазу", "norm": "норма 0.16–0.27", "value": round(brow_to_eye, 3), "display": f"{brow_to_eye:.3f}", "status": s_be, "tone": t_be},
-    ]
-
-    return {
-        "source": "mediapipe",
-        "metrics": metrics,
-        "symmetry_pct": round(symmetry_pct, 1),
-        "symmetry_status": sym_status,
-        "symmetry_tone": sym_tone,
-        "face_shape": face_shape,
-        "face_bbox": face_bbox,
-        "landmarks_norm": lms_norm,
-    }
-
-
-VISUAL_PROP_SPECS = [
-    ("Midface ratio", "норма 1.00–1.10"),
-    ("FWHR", "норма от 1.90"),
-    ("Кантальный тилт", "норма 4–8°"),
-    ("ESR (глаза к лицу)", "норма 0.45–0.48"),
-    ("Подбородок к фильтруму", "норма 2.00–2.25"),
-    ("Средняя треть к нижней", "норма 0.95–1.05"),
-    ("Нос к межглазному", "норма 0.95–1.05"),
-    ("Нос к ширине рта", "норма 0.62–0.72"),
-    ("Полнота губ", "норма 0.34–0.44"),
-    ("Бровь к глазу", "норма 0.16–0.27"),
+_FACE_CONTOUR_CHAINS = [
+    # Овал лица
+    [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109, 10],
+    # Правый и левый глаза
+    [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246, 33],
+    [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398, 362],
+    # Правая и левая брови
+    [70, 63, 105, 66, 107, 55, 65, 52, 53, 46],
+    [300, 293, 334, 296, 336, 285, 295, 282, 283, 276],
+    # Спинка и крылья носа
+    [168, 6, 197, 195, 5, 4, 1, 19, 94, 2],
+    [48, 115, 220, 45, 4, 275, 440, 344, 278],
+    [98, 97, 2, 326, 327],
+    # Внешний и внутренний контур губ
+    [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291, 375, 321, 405, 314, 17, 84, 181, 91, 146, 61],
+    [78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95, 78],
 ]
 
-
-def _normalize_visual_status(raw_status):
-    s = (raw_status or "").strip().lower()
-    if "идеал" in s and "далек" not in s and "близк" not in s:
-        return "Идеал", "green"
-    if "близк" in s:
-        return "Близко к идеалу", "green"
-    if "норм" in s or "выше" in s:
-        return "В норме", "blue"
-    if "зон" in s or "рост" in s or "ниже" in s:
-        return "Зона роста", "amber"
-    if "далек" in s or "асимм" in s:
-        return "Далеко от идеала", "red"
-    return "В норме", "blue"
-
-
-def extract_visual_geometry(text):
-    metrics = []
-    for name, norm in VISUAL_PROP_SPECS:
-        pat = rf"(?im)^\s*(?:PROP\s*\|\s*)?{re.escape(name)}\s*(?:\||:)\s*(.+)$"
-        m = re.search(pat, text)
-        if m:
-            raw_val = m.group(1).strip().strip("[]")
-            status, tone = _normalize_visual_status(raw_val)
-            metrics.append({
-                "name": name, "norm": norm, "value": None,
-                "display": "", "status": status, "tone": tone,
-            })
-
-    if len(metrics) < 5:
-        return None
-
-    m_shape = re.search(r"(?im)^\s*Форма\s+лица\s*[:|]\s*([А-Яа-яЁё\- ]+)", text)
-    face_shape = m_shape.group(1).strip().capitalize()[:24] if m_shape else ""
-
-    m_sym = re.search(r"(?im)^\s*Симметрия\s*[:|]\s*(\d{2,3})\s*%?", text)
-    sym_pct = max(70.0, min(98.0, float(m_sym.group(1)))) if m_sym else 90.0
-
-    if sym_pct >= 94.0:
-        sym_status, sym_tone = "Идеал", "green"
-    elif sym_pct >= 89.0:
-        sym_status, sym_tone = "В норме", "green"
-    elif sym_pct >= 84.0:
-        sym_status, sym_tone = "Умеренная", "amber"
-    else:
-        sym_status, sym_tone = "Асимметрия", "red"
-
-    return {
-        "source": "visual",
-        "metrics": metrics,
-        "symmetry_pct": round(sym_pct, 1),
-        "symmetry_status": sym_status,
-        "symmetry_tone": sym_tone,
-        "face_shape": face_shape,
-        "face_bbox": None,
-        "landmarks_norm": None,
-    }
-
-
-def format_geometry_for_prompt(geom):
-    if not geom:
-        return ""
-    lines = [
-        "ОБЪЕКТИВНЫЕ ЗАМЕРЫ ПО 468 ТОЧКАМ ЛИЦА (MediaPipe — учитывай их при оценке пропорций, глаз, бровей, носа, губ и подбородка):"
-    ]
-    for m in geom["metrics"]:
-        lines.append(f"- {m['name']} ({m['norm']}): {m['display']} [{m['status']}]")
-    lines.append(f"- Симметрия лица: {geom['symmetry_pct']:.1f}% [{geom['symmetry_status']}]")
-    lines.append(f"- Форма лица: {geom['face_shape']}")
-    return "\n".join(lines)
-
-
-# =====================================================================
-# ГЕНЕРАЦИЯ ТЁМНЫХ КАРТОЧЕК-ОТЧЁТОВ (PILLOW)
-# =====================================================================
-
-_FONT_CACHE = {}
-_FONT_LOCK = threading.Lock()
-_RESOLVED_FONTS = None
-
-_FONT_REGULAR_CANDIDATES = [
-    os.path.join(os.getcwd(), "fonts", "DejaVuSans.ttf"),
-    os.path.join(os.getcwd(), "fonts", "Roboto-Regular.ttf"),
-    "/system/fonts/Roboto-Regular.ttf",
-    "/system/fonts/Roboto-Medium.ttf",
-    "/system/fonts/NotoSans-Regular.ttf",
-    "/system/fonts/DroidSans.ttf",
-    "/data/data/com.termux/files/usr/share/fonts/TTF/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-    "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
-    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-    "C:/Windows/Fonts/segoeui.ttf",
-    "C:/Windows/Fonts/arial.ttf",
-    "/System/Library/Fonts/Supplemental/Arial.ttf",
-]
-
-_FONT_BOLD_CANDIDATES = [
-    os.path.join(os.getcwd(), "fonts", "DejaVuSans-Bold.ttf"),
-    os.path.join(os.getcwd(), "fonts", "Roboto-Bold.ttf"),
-    "/system/fonts/Roboto-Bold.ttf",
-    "/system/fonts/Roboto-Medium.ttf",
-    "/system/fonts/NotoSans-Bold.ttf",
-    "/system/fonts/DroidSans-Bold.ttf",
-    "/data/data/com.termux/files/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
-    "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
-    "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
-    "C:/Windows/Fonts/segoeuib.ttf",
-    "C:/Windows/Fonts/arialbd.ttf",
-    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-]
-
-
-def _font_supports_cyrillic(path):
-    if not path or not os.path.isfile(path):
-        return False
-    try:
-        font = ImageFont.truetype(path, size=24)
-        missing_mask = bytes(font.getmask("\u0378"))
-        for ch in ("А", "Ж", "Я"):
-            ch_mask = bytes(font.getmask(ch))
-            if not ch_mask or ch_mask == missing_mask:
-                return False
-        return True
-    except Exception:
-        return False
-
-
-def _scan_system_cyrillic_fonts():
-    reg_found, bold_found = None, None
-    search_dirs = [
-        "/system/fonts",
-        "/usr/share/fonts",
-        "/usr/local/share/fonts",
-        os.path.join(os.getcwd(), "fonts"),
-    ]
-    preferred_names = ("roboto", "noto", "dejavu", "inter", "liberation", "ubuntu", "droid", "sans")
-    for base in search_dirs:
-        if not os.path.isdir(base):
-            continue
-        for root, _, files in os.walk(base):
-            for fname in sorted(files):
-                low = fname.lower()
-                if not low.endswith((".ttf", ".otf")):
-                    continue
-                if any(bad in low for bad in ("emoji", "mono", "italic", "condensed", "thin", "light", "clock")):
-                    continue
-                if not any(pref in low for pref in preferred_names):
-                    continue
-                full_path = os.path.join(root, fname)
-                if not _font_supports_cyrillic(full_path):
-                    continue
-                if "bold" in low or "medium" in low:
-                    if not bold_found:
-                        bold_found = full_path
-                else:
-                    if not reg_found:
-                        reg_found = full_path
-                if reg_found and bold_found:
-                    return reg_found, bold_found
-    return reg_found, bold_found
-
-
-def _ensure_font_paths():
-    global _RESOLVED_FONTS
-    if _RESOLVED_FONTS is not None:
-        return _RESOLVED_FONTS
-
-    reg = next((p for p in _FONT_REGULAR_CANDIDATES if _font_supports_cyrillic(p)), None)
-    bold = next((p for p in _FONT_BOLD_CANDIDATES if _font_supports_cyrillic(p)), None)
-
-    if not reg or not bold:
-        s_reg, s_bold = _scan_system_cyrillic_fonts()
-        reg = reg or s_reg
-        bold = bold or s_bold
-
-    if not reg or not bold:
-        fonts_dir = os.path.join(os.getcwd(), "fonts")
-        os.makedirs(fonts_dir, exist_ok=True)
-        download_sources = {
-            "DejaVuSans.ttf": [
-                "https://cdn.jsdelivr.net/npm/dejavu-fonts-ttf@2.37.3/ttf/DejaVuSans.ttf",
-                "https://raw.githubusercontent.com/googlefonts/roboto/main/src/hinted/Roboto-Regular.ttf",
-            ],
-            "DejaVuSans-Bold.ttf": [
-                "https://cdn.jsdelivr.net/npm/dejavu-fonts-ttf@2.37.3/ttf/DejaVuSans-Bold.ttf",
-                "https://raw.githubusercontent.com/googlefonts/roboto/main/src/hinted/Roboto-Bold.ttf",
-            ],
-        }
-        for fname, urls in download_sources.items():
-            target = os.path.join(fonts_dir, fname)
-            if _font_supports_cyrillic(target):
-                continue
-            for url in urls:
-                try:
-                    r = requests.get(url, timeout=15)
-                    if r.status_code == 200 and len(r.content) > 40000:
-                        with open(target, "wb") as f:
-                            f.write(r.content)
-                        if _font_supports_cyrillic(target):
-                            break
-                        try:
-                            os.remove(target)
-                        except OSError:
-                            pass
-                except Exception as e:
-                    log_error(f"Не удалось скачать шрифт {fname}: {e}")
-
-        reg = reg or next((p for p in _FONT_REGULAR_CANDIDATES if _font_supports_cyrillic(p)), None)
-        bold = bold or next((p for p in _FONT_BOLD_CANDIDATES if _font_supports_cyrillic(p)), None)
-
-    if reg or bold:
-        _RESOLVED_FONTS = (reg or bold, bold or reg)
-        print(f"[Fonts] Используются шрифты: regular={_RESOLVED_FONTS[0]}, bold={_RESOLVED_FONTS[1]}")
-        return _RESOLVED_FONTS
-
-    log_error("Не найден ни один кириллический TTF-шрифт!")
-    return None, None
-
-
-def _get_font(size, bold=False):
-    key = (size, bold)
-    with _FONT_LOCK:
-        if key in _FONT_CACHE:
-            return _FONT_CACHE[key]
-        reg_path, bold_path = _ensure_font_paths()
-        path = bold_path if bold else reg_path
-        try:
-            if path:
-                font = ImageFont.truetype(path, size=size)
-            else:
-                try:
-                    font = ImageFont.load_default(size=size)
-                except TypeError:
-                    font = ImageFont.load_default()
-        except Exception:
-            font = ImageFont.load_default()
-        _FONT_CACHE[key] = font
-        return font
-
-
-def _tone_colors(tone):
-    if tone == "green":
-        return (16, 52, 40, 255), (26, 94, 68, 255), (52, 211, 153, 255)
-    if tone == "blue":
-        return (20, 41, 74, 255), (38, 79, 138, 255), (96, 165, 250, 255)
-    if tone == "amber":
-        return (56, 40, 18, 255), (104, 73, 28, 255), (251, 191, 36, 255)
-    return (58, 24, 30, 255), (112, 42, 52, 255), (248, 113, 113, 255)
-
-
-def _calc_percentile(score):
-    z = (score - 4.20) / 0.85
-    pct = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0))) * 100.0
-    return max(1, min(99, int(round(pct))))
-
-
-def _wrap_text_px(draw, text, font, max_width, max_lines=2):
-    words = text.split()
-    lines = []
-    cur = ""
-    for word in words:
-        candidate = f"{cur} {word}".strip()
-        if draw.textlength(candidate, font=font) <= max_width:
-            cur = candidate
-        else:
-            if cur:
-                lines.append(cur)
-                if len(lines) >= max_lines:
-                    break
-            cur = word
-    if cur and len(lines) < max_lines:
-        lines.append(cur)
-    if len(lines) == max_lines and words:
-        last = lines[-1]
-        while last and draw.textlength(last, font=font) > max_width:
-            last = last[:-1]
-        lines[-1] = last
-    return lines
-
-
-def _draw_card_box(draw, xy, radius=20, fill=(17, 20, 28, 255), outline=(30, 36, 51, 255)):
-    draw.rounded_rectangle(xy, radius=radius, fill=fill, outline=outline, width=1)
-
-
-def _draw_pill_badge(draw, x, y, w, h, text, tone="green", font_size=12):
-    bg, border, fg = _tone_colors(tone)
-    draw.rounded_rectangle((x, y, x + w, y + h), radius=h // 2, fill=bg, outline=border, width=1)
-    font = _get_font(font_size, bold=True)
-    bbox = draw.textbbox((0, 0), text, font=font)
-    tw = bbox[2] - bbox[0]
-    th = bbox[3] - bbox[1]
-    tx = x + (w - tw) / 2
-    ty = y + (h - th) / 2 - bbox[1]
-    draw.text((tx, ty), text, font=font, fill=fg)
-
-
-def _draw_ring_gauge(draw, cx, cy, radius, ratio, center_text, label_text, accent=(76, 141, 255, 255)):
-    ratio = max(0.0, min(1.0, ratio))
-    bbox = (cx - radius, cy - radius, cx + radius, cy + radius)
-    draw.arc(bbox, start=0, end=360, fill=(30, 38, 56, 255), width=7)
-    if ratio > 0.01:
-        end_deg = -90 + int(360 * ratio)
-        draw.arc(bbox, start=-90, end=end_deg, fill=accent, width=7)
-
-    f_val = _get_font(19 if len(center_text) <= 5 else 15, bold=True)
-    vb = draw.textbbox((0, 0), center_text, font=f_val)
-    vw, vh = vb[2] - vb[0], vb[3] - vb[1]
-    draw.text((cx - vw / 2, cy - vh / 2 - vb[1]), center_text, font=f_val, fill=(243, 244, 246, 255))
-
-    f_lbl = _get_font(13, bold=False)
-    lb = draw.textbbox((0, 0), label_text, font=f_lbl)
-    lw = lb[2] - lb[0]
-    draw.text((cx - lw / 2, cy + radius + 12), label_text, font=f_lbl, fill=(139, 149, 169, 255))
-
-
-def _draw_radar_chart(base_img, cx, cy, radius, items):
-    overlay = Image.new("RGBA", base_img.size, (0, 0, 0, 0))
-    odraw = ImageDraw.Draw(overlay)
-    n = len(items)
-    if n < 3:
-        return base_img
-
-    for frac in (0.33, 0.66, 1.0):
-        ring_pts = []
-        for i in range(n):
-            ang = -math.pi / 2 + 2 * math.pi * i / n
-            ring_pts.append((cx + radius * frac * math.cos(ang), cy + radius * frac * math.sin(ang)))
-        odraw.polygon(ring_pts, outline=(36, 45, 66, 200))
-
-    f_lbl = _get_font(12, bold=False)
-    data_pts = []
-    for i, (label, val) in enumerate(items):
-        ang = -math.pi / 2 + 2 * math.pi * i / n
-        cos_a, sin_a = math.cos(ang), math.sin(ang)
-        odraw.line((cx, cy, cx + radius * cos_a, cy + radius * sin_a), fill=(36, 45, 66, 180), width=1)
-
-        frac = max(0.12, min(1.0, val / 8.0))
-        data_pts.append((cx + radius * frac * cos_a, cy + radius * frac * sin_a))
-
-        lb = odraw.textbbox((0, 0), label, font=f_lbl)
-        lw, lh = lb[2] - lb[0], lb[3] - lb[1]
-        lx = cx + (radius + 14) * cos_a
-        ly = cy + (radius + 16) * sin_a
-
-        if cos_a < -0.35:
-            tx = lx - lw
-        elif cos_a > 0.35:
-            tx = lx
-        else:
-            tx = lx - lw / 2
-        ty = ly - lh / 2 - lb[1]
-        odraw.text((tx, ty), label, font=f_lbl, fill=(148, 163, 184, 255))
-
-    odraw.polygon(data_pts, fill=(76, 141, 255, 72), outline=(96, 165, 250, 235))
-    for px, py in data_pts:
-        odraw.ellipse((px - 3, py - 3, px + 3, py + 3), fill=(147, 197, 253, 255))
-
-    return Image.alpha_composite(base_img, overlay)
+_FACE_KEY_ANCHORS = (
+    10, 152, 234, 454, 172, 397, 33, 133, 362, 263,
+    159, 386, 52, 65, 282, 295, 168, 1, 2, 48, 278,
+    0, 17, 61, 291,
+)
 
 
 def _crop_portrait_with_mesh(image_bytes, target_size, geom=None):
@@ -1637,22 +1237,54 @@ def _crop_portrait_with_mesh(image_bytes, target_size, geom=None):
                 ((nx * w - crop_box[0]) * scale_x, (ny * h - crop_box[1]) * scale_y)
                 for nx, ny in geom["landmarks_norm"][:468]
             ]
-            anchor = mapped[159] if len(mapped) > 159 else (target_size * 0.42, target_size * 0.45)
             face_px_w = abs(mapped[454][0] - mapped[234][0]) if len(mapped) > 454 else target_size * 0.45
-            focus_r = max(28.0, face_px_w * 0.46)
-            edge_max = max(9.0, face_px_w * 0.14)
+            edge_max = max(8.0, face_px_w * 0.115)
+            edge_max_sq = edge_max * edge_max
 
-            zone_pts = [p for p in mapped if math.hypot(p[0] - anchor[0], p[1] - anchor[1]) <= focus_r]
-            for i in range(len(zone_pts)):
-                p1 = zone_pts[i]
-                d_center = math.hypot(p1[0] - anchor[0], p1[1] - anchor[1]) / focus_r
-                alpha_line = int(max(25, (1.0 - d_center * 0.72) * 145))
-                for j in range(i + 1, len(zone_pts)):
-                    p2 = zone_pts[j]
-                    if math.hypot(p1[0] - p2[0], p1[1] - p2[1]) <= edge_max:
-                        mdraw.line((p1[0], p1[1], p2[0], p2[1]), fill=(86, 165, 255, alpha_line), width=1)
-            for px, py in zone_pts[::2]:
-                mdraw.ellipse((px - 1.2, py - 1.2, px + 1.2, py + 1.2), fill=(170, 215, 255, 195))
+            # 1. Лёгкая полигональная сетка по всему лицу (до 4 ближайших соседей на точку)
+            drawn_edges = set()
+            n_pts = len(mapped)
+            for i in range(n_pts):
+                x1p, y1p = mapped[i]
+                neighbors = []
+                for j in range(n_pts):
+                    if i == j:
+                        continue
+                    dx = x1p - mapped[j][0]
+                    if abs(dx) > edge_max:
+                        continue
+                    dy = y1p - mapped[j][1]
+                    if abs(dy) > edge_max:
+                        continue
+                    d2 = dx * dx + dy * dy
+                    if d2 <= edge_max_sq:
+                        neighbors.append((d2, j))
+                neighbors.sort(key=lambda item: item[0])
+                for _, j in neighbors[:4]:
+                    edge = (i, j) if i < j else (j, i)
+                    if edge not in drawn_edges:
+                        drawn_edges.add(edge)
+                        mdraw.line(
+                            (x1p, y1p, mapped[j][0], mapped[j][1]),
+                            fill=(86, 165, 255, 58),
+                            width=1,
+                        )
+
+            # 2. Чёткие анатомические контуры (овал, глаза, брови, нос, губы)
+            for chain in _FACE_CONTOUR_CHAINS:
+                if max(chain) < n_pts:
+                    poly = [mapped[idx] for idx in chain]
+                    mdraw.line(poly, fill=(110, 185, 255, 138), width=1)
+
+            # 3. Точки сетки по всей поверхности лица
+            for px, py in mapped[::2]:
+                mdraw.ellipse((px - 1.0, py - 1.0, px + 1.0, py + 1.0), fill=(175, 220, 255, 175))
+
+            # 4. Акцентные ключевые антропометрические точки
+            for idx in _FACE_KEY_ANCHORS:
+                if idx < n_pts:
+                    px, py = mapped[idx]
+                    mdraw.ellipse((px - 1.8, py - 1.8, px + 1.8, py + 1.8), fill=(215, 240, 255, 235))
 
             cropped = Image.alpha_composite(cropped, mesh_layer)
 
@@ -2088,7 +1720,9 @@ def notify_admins_once(alert_key, text):
 
 
 def call_gemini_api(api_key, model_name, image_bytes, prompt):
-    url = f"https://adonis-bot.godjo2satoru.workers.dev/v1beta/models/{model_name}:generateContent"
+    url = f"{GEMINI_BASE_URL}/v1beta/models/{model_name}:generateContent"
+    headers = {"Content-Type": "application/json", "x-goog-api-key": api_key.strip()}
+    payload = {
 
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key.strip()}
     payload = {
@@ -2139,6 +1773,9 @@ def call_gemini_api(api_key, model_name, image_bytes, prompt):
 
 def run_gemini_pipeline(processed_bytes, prompt):
     errors = []
+    skipped_by_429 = False
+    skipped_by_404 = False
+    skipped_by_bad_key = False
     deadline = time.time() + PIPELINE_DEADLINE
     num_keys = len(API_KEYS)
     start_idx = next(_key_rr) % num_keys
@@ -2151,6 +1788,7 @@ def run_gemini_pipeline(processed_bytes, prompt):
             break
         with _key_lock:
             if _model_blocked_until.get(model_name, 0) > now:
+                skipped_by_404 = True
                 continue
 
         for offset in range(num_keys):
@@ -2161,7 +1799,11 @@ def run_gemini_pipeline(processed_bytes, prompt):
 
             idx = (start_idx + offset) % num_keys
             with _key_lock:
-                if _key_blocked_until.get(idx, 0) > now or _pair_blocked_until.get((idx, model_name), 0) > now:
+                if _key_blocked_until.get(idx, 0) > now:
+                    skipped_by_bad_key = True
+                    continue
+                if _pair_blocked_until.get((idx, model_name), 0) > now:
+                    skipped_by_429 = True
                     continue
 
             try:
@@ -2186,6 +1828,14 @@ def run_gemini_pipeline(processed_bytes, prompt):
             except Exception as exc:
                 log_error(f"Ошибка ключа #{idx + 1} ({model_name}): {exc}")
                 errors.append((None, str(exc)))
+
+    if not errors:
+        if skipped_by_429:
+            errors.append((429, "Все ключи временно находятся в паузе лимита 429."))
+        elif skipped_by_404:
+            errors.append((404, "Все активные модели временно отключены (404)."))
+        elif skipped_by_bad_key:
+            errors.append((401, "Все ключи временно отключены (401/403)."))
 
     if errors and all(code == 429 for code, _ in errors):
         notify_admins_once("all_keys_429", "⚠️ Все активные ключи Gemini упёрлись в лимит 429.")
@@ -2228,8 +1878,8 @@ ADULT_RATING_PROMPT = """Ты — строгий, беспристрастный
 КАЛИБРОВКА ПО 8-БАЛЛЬНОЙ ШКАЛЕ:
 - Шкала строго от 1.0 до 8.0.
 - 4.1–4.3 — средняя норма (Мхтн). Большинство обычных людей находятся в диапазоне 3.8–4.6.
-- 5.0–5.5 — заметно выше среднего (Хтн).
-- 5.6–6.4 — сильная костная структура и привлекательные пропорции (Лоу чад лайт).
+- 5.0–5.4 — заметно выше среднего (Хтн).
+- 5.5–6.4 — сильная костная структура и привлекательные пропорции (Лоу чад лайт).
 - 6.5–6.9 — выраженно модельные черты (Чад лайт).
 - 7.0+ — исключительный модельный уровень (Чад).
 
@@ -2524,13 +2174,14 @@ def format_user_status_short(user_id):
     free_limit, pro_tier, pro_until, _ = get_user_access(user_id)
     if is_admin(user_id):
         return "👑 <b>Администратор</b> • без лимитов"
+    extra_str = f" (+{free_limit} доп.)" if free_limit > 0 else ""
     if pro_tier >= 2:
         left = get_pro_remaining_today(user_id, pro_tier)
-        return f"💎 <b>PRO Навсегда</b> • сегодня {left}/{PRO_LIFE_DAILY_LIMIT}"
+        return f"💎 <b>PRO Навсегда</b> • сегодня {left}/{PRO_LIFE_DAILY_LIMIT}{extra_str}"
     if pro_tier == 1:
         left = get_pro_remaining_today(user_id, pro_tier)
         until_str = format_date_from_ts(pro_until) if pro_until > 0 else "—"
-        return f"👑 <b>PRO до {until_str}</b> • сегодня {left}/{PRO30_DAILY_LIMIT}"
+        return f"👑 <b>PRO до {until_str}</b> • сегодня {left}/{PRO30_DAILY_LIMIT}{extra_str}"
     return f"⚡ <b>Базовый</b> • доступно сканов: <b>{free_limit}</b>"
 
 
@@ -2912,7 +2563,17 @@ def cmd_clear_cache_slash(message):
 
 
 @bot.message_handler(
-    func=lambda m: bool(m.text and m.text.startswith(".") and is_admin(m.from_user.id)),
+    func=lambda m: bool(
+        m.text
+        and m.text.startswith(".")
+        and is_admin(m.from_user.id)
+        and not is_awaiting_broadcast(m.from_user.id)
+        and not is_awaiting_model(m.from_user.id)
+    ),
+    content_types=["text"],
+)
+def handle_admin_dot_commands(message):
+
     content_types=["text"],
 )
 def handle_admin_dot_commands(message):
@@ -2920,366 +2581,17 @@ def handle_admin_dot_commands(message):
     body = re.sub(r"\s+", " ", message.text[1:].strip())
     low = body.lower()
 
-    if low in ("админ", "admin", "помощь", "help"):
-        bot.reply_to(message, get_admin_help_text(), parse_mode="HTML")
-        return
-
-    if low in ("стата", "статистика", "stats"):
-        bot.reply_to(message, get_bot_stats_text(), parse_mode="HTML")
-        return
-
-    if low in ("очистить кэш", "кэш", "clear_cache"):
-        with db_conn() as conn:
-            conn.cursor().execute("DELETE FROM photo_cache")
-        bot.reply_to(message, "✅ Кэш фото очищен.")
-        return
-
-    # . модель / . модели / . модель <имя> / . модель сброс
-    m_model = re.match(r"^(?:модель|модели|model|models)(?:\s+(.+))?$", body, flags=re.IGNORECASE)
-    if m_model:
-        clear_pending_modes(user_id)
-        arg = (m_model.group(1) or "").strip()
-        if not arg:
-            text, markup = build_model_manager_view()
-            bot.reply_to(message, text, parse_mode="HTML", reply_markup=markup)
-            return
-        if arg.lower() in ("сброс", "reset", "default"):
-            saved = set_active_models(DEFAULT_MODELS)
-            bot.reply_to(
-                message,
-                f"✅ Модель сброшена на стандартную: <code>{html.escape(', '.join(saved))}</code>",
-                parse_mode="HTML",
-            )
-            return
-        parsed = parse_models_input(arg)
-        if not parsed:
-            bot.reply_to(
-                message,
-                "⚠️ Некорректное название модели. Пример: <code>. модель gemini-3.5-flash-lite</code>",
-                parse_mode="HTML",
-            )
-            return
-        saved = set_active_models(parsed)
-        bot.reply_to(
-            message,
-            f"✅ Активная модель обновлена и сохранена:\n<code>{html.escape(', '.join(saved))}</code>",
-            parse_mode="HTML",
-        )
-        return
-
-    if low == "рассылка":
-        clear_pending_modes(user_id)
-        with _broadcast_lock:
-            _broadcast_state[user_id] = {"step": "await_content"}
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="bc_cancel"))
-        bot.reply_to(
-            message,
-            "📢 <b>Режим рассылки</b>\n\n"
-            "Отправь следующим сообщением <b>текст</b> или <b>фото с подписью</b>. "
-            "Я покажу предпросмотр с кнопкой подтверждения перед отправкой.",
-            parse_mode="HTML",
-            reply_markup=markup,
-        )
-        return
-
-    # . выдать премиум @user [30|навсегда]
-    m_grant = re.match(r"^выдать\s+премиум\s+(\S+)(?:\s+(\S+))?$", body, flags=re.IGNORECASE)
-    if m_grant:
-        target_id = resolve_target_user(m_grant.group(1))
-        if not target_id:
-            bot.reply_to(message, "⚠️ Пользователь не найден в базе. Укажи ID или дождись, пока он напишет боту.")
-            return
-        dur_raw = (m_grant.group(2) or "навсегда").lower()
-        ensure_user(target_id)
-
-        if dur_raw in ("навсегда", "0", "life", "forever"):
-            with db_conn() as conn:
-                conn.cursor().execute(
-                    "UPDATE users SET is_premium = 1, pro_tier = 2, pro_until = 0 WHERE user_id = ?",
-                    (target_id,),
-                )
-            bot.reply_to(message, f"✅ Выдан <b>PRO Навсегда</b> для <code>{target_id}</code>.", parse_mode="HTML")
-            try:
-                bot.send_message(target_id, "💎 Тебе активирован <b>PRO Навсегда</b>!", parse_mode="HTML")
-            except Exception:
-                pass
-            return
-
-        if not dur_raw.isdigit() or int(dur_raw) <= 0:
-            bot.reply_to(message, "⚠️ Укажи число дней (> 0) или слово <code>навсегда</code>.", parse_mode="HTML")
-            return
-
-        days = int(dur_raw)
-        now = int(time.time())
-        with db_conn() as conn:
-            c = conn.cursor()
-            c.execute(
-                "SELECT COALESCE(pro_tier, 0), COALESCE(pro_until, 0) FROM users WHERE user_id = ?",
-                (target_id,),
-            )
-            row = c.fetchone()
-            cur_tier = row[0] if row else 0
-            cur_until = row[1] if row else 0
-            if cur_tier >= 2:
-                bot.reply_to(
-                    message,
-                    f"ℹ️ У <code>{target_id}</code> уже активен <b>PRO Навсегда</b>. "
-                    "Чтобы снять его, используй <code>. забрать премиум</code>.",
-                    parse_mode="HTML",
-                )
-                return
-            base = max(now, cur_until) if cur_tier == 1 else now
-            until_ts = base + days * 86400
-            c.execute(
-                "UPDATE users SET is_premium = 1, pro_tier = 1, pro_until = ? WHERE user_id = ?",
-                (until_ts, target_id),
-            )
-        bot.reply_to(
-            message,
-            f"✅ Выдан <b>PRO на {days} дн.</b> (до {format_date_from_ts(until_ts)}) для <code>{target_id}</code>.",
-            parse_mode="HTML",
-        )
-        try:
-            bot.send_message(
-                target_id,
-                f"👑 Тебе активирован <b>PRO на {days} дн.</b> (до {format_date_from_ts(until_ts)})!",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-        return
-
-    # . забрать премиум @user
-    m_rev = re.match(r"^забрать\s+премиум\s+(\S+)$", body, flags=re.IGNORECASE)
-    if m_rev:
-        target_id = resolve_target_user(m_rev.group(1))
-        if not target_id:
-            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
-            return
-        ensure_user(target_id)
-        with db_conn() as conn:
-            conn.cursor().execute(
-                "UPDATE users SET is_premium = 0, pro_tier = 0, pro_until = 0 WHERE user_id = ?",
-                (target_id,),
-            )
-        bot.reply_to(message, f"❌ PRO снят у <code>{target_id}</code>.", parse_mode="HTML")
-        return
-
-    # . выдать сканы @user 10
-    m_scans = re.match(r"^выдать\s+сканы\s+(\S+)\s+(\d+)$", body, flags=re.IGNORECASE)
-    if m_scans:
-        target_id = resolve_target_user(m_scans.group(1))
-        amount = int(m_scans.group(2))
-        if not target_id:
-            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
-            return
-        if amount <= 0:
-            bot.reply_to(message, "⚠️ Количество сканов должно быть больше 0.")
-            return
-        ensure_user(target_id)
-        with db_conn() as conn:
-            conn.cursor().execute(
-                "UPDATE users SET free_limit = free_limit + ? WHERE user_id = ?",
-                (amount, target_id),
-            )
-        bot.reply_to(message, f"✅ Начислено <b>+{amount} сканов</b> юзеру <code>{target_id}</code>.", parse_mode="HTML")
-        try:
-            bot.send_message(target_id, f"⚡ Тебе начислено <b>+{amount} сканов</b> на баланс!", parse_mode="HTML")
-        except Exception:
-            pass
-        return
-
-    # . инфо @user
-    m_info = re.match(r"^инфо\s+(\S+)$", body, flags=re.IGNORECASE)
-    if m_info:
-        target_id = resolve_target_user(m_info.group(1))
-        if not target_id:
-            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
-            return
-        bot.reply_to(message, build_user_dossier_text(target_id), parse_mode="HTML")
-        return
-
-    # . бан @user / . разбан @user
-    m_ban = re.match(r"^(бан|разбан)\s+(\S+)$", body, flags=re.IGNORECASE)
-    if m_ban:
-        action = m_ban.group(1).lower()
-        target_id = resolve_target_user(m_ban.group(2))
-        if not target_id:
-            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
-            return
-        if is_admin(target_id):
-            bot.reply_to(message, "⚠️ Нельзя забанить администратора.")
-            return
-        ensure_user(target_id)
-        ban_val = 1 if action == "бан" else 0
-        with db_conn() as conn:
-            conn.cursor().execute("UPDATE users SET is_banned = ? WHERE user_id = ?", (ban_val, target_id))
-        msg = f"⛔ Пользователь <code>{target_id}</code> забанен." if ban_val else f"✅ Пользователь <code>{target_id}</code> разбанен."
-        bot.reply_to(message, msg, parse_mode="HTML")
-        return
-
-    bot.reply_to(message, "⚠️ Неизвестная команда. Напиши <code>. админ</code> для списка.", parse_mode="HTML")
-
-
-def _prepare_broadcast_preview(message):
-    user_id = message.from_user.id
-    with _broadcast_lock:
-        state = _broadcast_state.get(user_id)
-    if not state or state.get("step") != "await_content":
-        return False
-
-    if message.content_type == "photo":
-        payload = {
-            "step": "ready",
-            "type": "photo",
-            "file_id": message.photo[-1].file_id,
-            "caption": message.caption or "",
-        }
-    elif message.content_type == "text":
-        payload = {
-            "step": "ready",
-            "type": "text",
-            "text": message.text,
-        }
-    else:
-        bot.reply_to(message, "⚠️ Для рассылки отправь текст или фото с подписью.")
-        return True
-
-    with _broadcast_lock:
-        _broadcast_state[user_id] = payload
-
-    with db_conn() as conn:
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(is_banned, 0) = 0")
-        total_targets = c.fetchone()[0]
-
-    markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        InlineKeyboardButton(f"✅ Отправить ({total_targets})", callback_data="bc_send"),
-        InlineKeyboardButton("❌ Отмена", callback_data="bc_cancel"),
-    )
-
-    bot.send_message(message.chat.id, "👁 <b>Предпросмотр рассылки:</b>", parse_mode="HTML")
-    if payload["type"] == "photo":
-        bot.send_photo(message.chat.id, payload["file_id"], caption=payload["caption"], reply_markup=markup)
-    else:
-        bot.send_message(message.chat.id, payload["text"], reply_markup=markup)
-    return True
-
-
-def _run_broadcast_worker(admin_chat_id, payload):
-    with db_conn() as conn:
-        c = conn.cursor()
-        c.execute("SELECT user_id FROM users WHERE COALESCE(is_banned, 0) = 0")
-        user_ids = [row[0] for row in c.fetchall()]
-
-    ok_cnt, fail_cnt = 0, 0
-    for uid in user_ids:
-        try:
-            if payload["type"] == "photo":
-                bot.send_photo(uid, payload["file_id"], caption=payload["caption"])
-            else:
-                bot.send_message(uid, payload["text"])
-            ok_cnt += 1
-        except Exception:
-            fail_cnt += 1
-        time.sleep(0.05)
-
-    try:
-        bot.send_message(
-            admin_chat_id,
-            f"📢 <b>Рассылка завершена!</b>\n"
-            f"Доставлено: <b>{ok_cnt}</b> | Ошибок/блок: <b>{fail_cnt}</b>",
-            parse_mode="HTML",
-        )
-    except Exception:
-        pass
-
-
-@bot.message_handler(
-    func=lambda m: is_admin(m.from_user.id) and is_awaiting_broadcast(m.from_user.id),
-    content_types=["text", "photo"],
-)
-def handle_admin_broadcast_input(message):
-    _prepare_broadcast_preview(message)
-
-
-@bot.message_handler(
-    func=lambda m: is_admin(m.from_user.id) and is_awaiting_model(m.from_user.id),
-    content_types=["text"],
-)
-def handle_admin_model_input(message):
-    user_id = message.from_user.id
-    parsed = parse_models_input(message.text)
-    if not parsed:
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="model_cancel"))
-        bot.reply_to(
-            message,
-            "⚠️ Некорректное имя модели. Введи название латиницей, например:\n"
-            "<code>gemini-3.5-flash-lite</code>\n"
-            "<i>Или несколько моделей через запятую.</i>",
-            parse_mode="HTML",
-            reply_markup=markup,
-        )
-        return
-
-    clear_awaiting_model(user_id)
-    saved = set_active_models(parsed)
-    text, markup = build_model_manager_view()
-    bot.reply_to(
-        message,
-        f"✅ Модель обновлена и сохранена: <code>{html.escape(', '.join(saved))}</code>\n\n{text}",
-        parse_mode="HTML",
-        reply_markup=markup,
-    )
-
-
-# =====================================================================
-# ОБРАБОТКА ФОТО И ОЧЕРЕДЬ СКАНИРОВАНИЯ
-# =====================================================================
-
-def build_report_markup(photo_hash, include_profile_btn=True, is_profile=False):
-    markup = InlineKeyboardMarkup(row_width=2)
-    if photo_hash:
-        btn_label = "📊 Подробный разбор профиля" if is_profile else "📊 Подробный разбор"
-        markup.add(InlineKeyboardButton(btn_label, callback_data=f"full_{photo_hash}"))
-    row2 = []
-    if include_profile_btn and not is_profile:
-        row2.append(InlineKeyboardButton("📐 Профиль (PRO)", callback_data="profile_scan"))
-    row2.append(InlineKeyboardButton("🏠 Меню", callback_data="main_menu_new"))
-    markup.add(*row2)
-    return markup
-
-
-def _build_front_caption(scores_text, verdict="", limit_info=""):
-    score = extract_final_score(scores_text)
-    m_cat = re.search(r"(?im)^Категория[:\s]+(.+)$", scores_text)
-    cat = m_cat.group(1).strip() if m_cat else (category_by_score(score) if score else "")
-    head = (
-        f"<b>Результат: {score:.1f}/8 • {html.escape(cat)}</b>"
-        if score is not None
-        else "<b>Карточка анализа лица готова</b>"
-    )
-    quote_block = f"\n<blockquote>{html.escape(verdict)}</blockquote>" if verdict else ""
-    return f"{head}{quote_block}{limit_info}"
-
-
-def _build_profile_caption(scores_text, verdict="", limit_info=""):
-    score = extract_final_score(scores_text)
-    m_cat = re.search(r"(?im)^Категория[:\s]+(.+)$", scores_text)
-    cat = m_cat.group(1).strip() if m_cat else (category_by_score(score) if score else "")
-    head = (
-        f"<b>📐 Профиль: {score:.1f}/8 • {html.escape(cat)}</b>"
-        if score is not None
-        else "<b>📐 Анализ бокового профиля готов</b>"
-    )
-    quote_block = f"\n<blockquote>{html.escape(verdict)}</blockquote>" if verdict else ""
-    return f"{head}{quote_block}{limit_info}"
-
-
-def _send_report_card_or_text(chat_id, card_bytes, scores_text, full_text, photo_hash, verdict="", limit_info="", is_profile=False):
+def _send_report_card_or_text(
+    chat_id,
+    card_bytes,
+    scores_text,
+    full_text,
+    photo_hash,
+    verdict="",
+    limit_info="",
+    is_profile=False,
+    card_file_id="",
+):
     markup = build_report_markup(
         photo_hash if full_text else None,
         include_profile_btn=not is_profile,
@@ -3288,17 +2600,27 @@ def _send_report_card_or_text(chat_id, card_bytes, scores_text, full_text, photo
     if not verdict:
         verdict = extract_verdict(scores_text)
 
+    caption = (
+        _build_profile_caption(scores_text, verdict=verdict, limit_info=limit_info)
+        if is_profile
+        else _build_front_caption(scores_text, verdict=verdict, limit_info=limit_info)
+    )
+
+    if card_file_id:
+        try:
+            bot.send_photo(chat_id, card_file_id, caption=caption, parse_mode="HTML", reply_markup=markup)
+            return card_file_id
+        except Exception as e:
+            log_error(f"Не удалось отправить карточку по file_id, пробую резерв: {e}")
+
     if card_bytes:
         try:
-            caption = (
-                _build_profile_caption(scores_text, verdict=verdict, limit_info=limit_info)
-                if is_profile
-                else _build_front_caption(scores_text, verdict=verdict, limit_info=limit_info)
-            )
             with io.BytesIO(card_bytes) as bio:
                 bio.name = "adonis_psl_card.jpg"
-                bot.send_photo(chat_id, bio, caption=caption, parse_mode="HTML", reply_markup=markup)
-            return
+                sent = bot.send_photo(chat_id, bio, caption=caption, parse_mode="HTML", reply_markup=markup)
+            if sent and getattr(sent, "photo", None):
+                return sent.photo[-1].file_id
+            return ""
         except Exception as e:
             log_error(f"Не удалось отправить карточку, шлю текстом: {e}")
 
@@ -3309,30 +2631,57 @@ def _send_report_card_or_text(chat_id, card_bytes, scores_text, full_text, photo
         parse_mode="HTML",
         reply_markup=markup,
     )
+    return ""
 
 
-def _format_full_breakdown(full_text, geom=None):
-    parts = []
-    if geom and geom.get("metrics"):
-        title = "📐 Пропорции (468 точек лица):" if geom.get("source") == "mediapipe" else "📐 Пропорции лица:"
-        lines = [title]
-        for m in geom["metrics"]:
-            if m.get("display"):
-                lines.append(f"• {m['name']}: {m['display']} — {m['status']} ({m['norm']})")
-            else:
-                lines.append(f"• {m['name']}: {m['status']} ({m['norm']})")
-        lines.append(f"• Симметрия: {geom['symmetry_pct']:.1f}% — {geom['symmetry_status']}")
-        if geom.get("face_shape"):
-            lines.append(f"• Форма лица: {geom['face_shape']}")
-        parts.append("\n".join(lines))
-    if full_text:
-        parts.append(full_text.strip())
-    return "\n\n".join(parts)
+    if low in ("стата", "статистика", "stats"):
+        bot.reply_to(message, get_bot_stats_text(), parse_mode="HTML")
+        return
+
+def _send_no_scans_prompt(chat_id):
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton(f"🤝 Пригласить друга (+{REFERRAL_BONUS} скан)", callback_data="get_ref"))
+    markup.add(InlineKeyboardButton("💎 Купить сканы / PRO", callback_data="buy_menu"))
+    bot.send_message(
+        chat_id,
+        "❌ <b>Бесплатные сканы исчерпаны.</b>\n\n"
+        f"Пригласи друга по ссылке (+{REFERRAL_BONUS} скан) или выбери тариф:",
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
+
+
+def _send_pro_daily_limit_prompt(chat_id, daily_limit):
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("⚡ Докупить пакет сканов", callback_data="buy_menu"))
+    bot.send_message(
+        chat_id,
+        f"⏳ <b>Дневной лимит PRO исчерпан ({daily_limit}/{daily_limit}).</b>\n"
+        "Лимит обновится завтра в 00:00, либо можно докупить пакет дополнительных сканов:",
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
 
 
 def process_adult_photo(message, status_msg=None):
     user_id = message.from_user.id
     chat_id = message.chat.id
+
+    # Предварительная проверка доступа ДО скачивания фото и обращения к кэшу
+    free_limit, pro_tier, _, _ = get_user_access(user_id)
+    admin_user = is_admin(user_id)
+    daily_limit = get_pro_daily_limit_for_tier(pro_tier)
+
+    if not admin_user:
+        if pro_tier > 0:
+            if get_pro_remaining_today(user_id, pro_tier) <= 0 and free_limit <= 0:
+                delete_status_safe(chat_id, status_msg)
+                _send_pro_daily_limit_prompt(chat_id, daily_limit)
+                return
+        elif free_limit <= 0:
+            delete_status_safe(chat_id, status_msg)
+            _send_no_scans_prompt(chat_id)
+            return
 
     try:
         if not status_msg:
@@ -3351,46 +2700,34 @@ def process_adult_photo(message, status_msg=None):
     photo_hash = hashlib.sha256(CACHE_VERSION.encode("utf-8") + processed_bytes).hexdigest()[:32]
     cached = cache_get(photo_hash)
     if cached:
-        scores_text, full_text, card_bytes = cached
+        scores_text, full_text, card_bytes, card_file_id = cached
         delete_status_safe(chat_id, status_msg)
-        _send_report_card_or_text(chat_id, card_bytes, scores_text, full_text, photo_hash, is_profile=False)
+        _send_report_card_or_text(
+            chat_id, card_bytes, scores_text, full_text, photo_hash,
+            is_profile=False, card_file_id=card_file_id,
+        )
         return
 
-    _, pro_tier, _, _ = get_user_access(user_id)
-    admin_user = is_admin(user_id)
     consumed_mode = None
-    daily_limit = get_pro_daily_limit_for_tier(pro_tier)
-
     if not admin_user:
         if pro_tier > 0:
-            if not try_consume_pro_scan(user_id, daily_limit):
+            if try_consume_pro_scan(user_id, daily_limit):
+                consumed_mode = "pro"
+            elif try_consume_extra_scan(user_id):
+                consumed_mode = "extra"
+            else:
                 delete_status_safe(chat_id, status_msg)
-                bot.send_message(
-                    chat_id,
-                    f"⏳ <b>Дневной лимит PRO исчерпан ({daily_limit}/{daily_limit}).</b>\n"
-                    "Лимит обновится завтра в 00:00.",
-                    parse_mode="HTML",
-                )
+                _send_pro_daily_limit_prompt(chat_id, daily_limit)
                 return
-            consumed_mode = "pro"
         else:
             if not try_consume_scan(user_id):
                 delete_status_safe(chat_id, status_msg)
-                markup = InlineKeyboardMarkup(row_width=1)
-                markup.add(InlineKeyboardButton(f"🤝 Пригласить друга (+{REFERRAL_BONUS} скан)", callback_data="get_ref"))
-                markup.add(InlineKeyboardButton("💎 Купить сканы / PRO", callback_data="buy_menu"))
-                bot.send_message(
-                    chat_id,
-                    "❌ <b>Бесплатные сканы исчерпаны.</b>\n\n"
-                    f"Пригласи друга по ссылке (+{REFERRAL_BONUS} скан) или выбери тариф:",
-                    parse_mode="HTML",
-                    reply_markup=markup,
-                )
+                _send_no_scans_prompt(chat_id)
                 return
             consumed_mode = "free"
 
     def refund_if_needed():
-        if consumed_mode == "free":
+        if consumed_mode in ("free", "extra"):
             refund_scan(user_id)
         elif consumed_mode == "pro":
             refund_pro_scan(user_id)
@@ -3429,9 +2766,6 @@ def process_adult_photo(message, status_msg=None):
         except Exception as card_err:
             log_error(f"Ошибка рендера карточки: {card_err}")
 
-        cache_put(photo_hash, scores_text, full_combined, card_image=card_bytes)
-        record_user_scan_stats(user_id, score=final_score)
-
         if consumed_mode == "free":
             rem_limit, _, _, _ = get_user_access(user_id)
             limit_info = (
@@ -3439,6 +2773,9 @@ def process_adult_photo(message, status_msg=None):
                 if rem_limit == 0
                 else f"\n<i>Осталось сканов: {rem_limit}</i>"
             )
+        elif consumed_mode == "extra":
+            rem_limit, _, _, _ = get_user_access(user_id)
+            limit_info = f"\n<i>Списан доп. скан из пакета (осталось доп.: {rem_limit})</i>"
         elif consumed_mode == "pro":
             pro_left = get_pro_remaining_today(user_id, pro_tier)
             limit_info = f"\n<i>PRO-сканов на сегодня: {pro_left}/{daily_limit}</i>"
@@ -3446,18 +2783,145 @@ def process_adult_photo(message, status_msg=None):
             limit_info = ""
 
         delete_status_safe(chat_id, status_msg)
-        _send_report_card_or_text(
+        sent_file_id = _send_report_card_or_text(
             chat_id, card_bytes, scores_text, full_combined, photo_hash,
             verdict=verdict, limit_info=limit_info, is_profile=False,
         )
         scan_completed = True
+        cache_put(photo_hash, scores_text, full_combined, card_image=card_bytes, card_file_id=sent_file_id)
+        record_user_scan_stats(user_id, score=final_score)
 
     except Exception as e:
         log_error(f"Ошибка в process_adult_photo: {e}")
         if not scan_completed:
             refund_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, "⏳ Произошёл технический сбой. Попробуй ещё раз.")
+    finally:
+        gc.collect()
+
+
+def process_profile_photo(message, status_msg=None):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    def _keep_profile_markup():
+        set_awaiting_profile(user_id)
+        m = InlineKeyboardMarkup()
+        m.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_profile"))
+        return m
+
+    free_limit, pro_tier, _, _ = get_user_access(user_id)
+    admin_user = is_admin(user_id)
+    daily_limit = get_pro_daily_limit_for_tier(pro_tier)
+
+    if not admin_user:
+        if pro_tier <= 0:
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, "👑 Анализ бокового профиля доступен только с активным PRO (/buy).")
+            return
+        if get_pro_remaining_today(user_id, pro_tier) <= 0 and free_limit <= 0:
+            delete_status_safe(chat_id, status_msg)
+            _send_pro_daily_limit_prompt(chat_id, daily_limit)
+            return
+
+    try:
+        if not status_msg:
+            status_msg = send_status_safe(message, "📐 Анализирую структуру бокового профиля...")
+        processed_bytes = download_and_process_photo(message)
+    except ValueError as val_err:
         delete_status_safe(chat_id, status_msg)
-        bot.send_message(chat_id, "⏳ Произошёл технический сбой. Попробуй ещё раз.")
+        bot.send_message(
+            chat_id,
+            f"⚠️ {val_err}\nРежим профиля активен — отправь другое фото сбоку или нажми «Отмена».",
+            reply_markup=_keep_profile_markup(),
+        )
+        return
+    except Exception as e:
+        delete_status_safe(chat_id, status_msg)
+        log_error(f"Ошибка скачивания фото профиля: {e}")
+        bot.send_message(chat_id, "⏳ Не удалось скачать фото. Попробуй ещё раз.", reply_markup=_keep_profile_markup())
+        return
+
+    photo_hash = "p" + hashlib.sha256(PROFILE_CACHE_VERSION.encode("utf-8") + processed_bytes).hexdigest()[:31]
+    cached = cache_get(photo_hash)
+    if cached:
+        scores_text, full_text, card_bytes, card_file_id = cached
+        delete_status_safe(chat_id, status_msg)
+        _send_report_card_or_text(
+            chat_id, card_bytes, scores_text, full_text, photo_hash,
+            is_profile=True, card_file_id=card_file_id,
+        )
+        return
+
+    consumed_mode = None
+    if not admin_user:
+        if try_consume_pro_scan(user_id, daily_limit):
+            consumed_mode = "pro"
+        elif try_consume_extra_scan(user_id):
+            consumed_mode = "extra"
+        else:
+            delete_status_safe(chat_id, status_msg)
+            _send_pro_daily_limit_prompt(chat_id, daily_limit)
+            return
+
+    def refund_profile_if_needed():
+        if consumed_mode == "pro":
+            refund_pro_scan(user_id)
+        elif consumed_mode == "extra":
+            refund_scan(user_id)
+
+    scan_completed = False
+    try:
+        raw_response, api_errors = run_gemini_pipeline(processed_bytes, PROFILE_RATING_PROMPT)
+        if not raw_response:
+            refund_profile_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, format_api_failure(api_errors), parse_mode="HTML", reply_markup=_keep_profile_markup())
+            return
+
+        profile_data, full_text = parse_profile_response(raw_response)
+        if not profile_data:
+            refund_profile_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(
+                chat_id,
+                "🤔 Не удалось распознать боковой профиль. Пришли чёткое фото строго сбоку (90°), чтобы была видна линия челюсти.\n\n"
+                "<i>Режим профиля остаётся активным — отправь следующее фото или нажми «Отмена».</i>",
+                parse_mode="HTML",
+                reply_markup=_keep_profile_markup(),
+            )
+            return
+
+        card_bytes = None
+        try:
+            card_bytes = render_profile_report_card(processed_bytes, profile_data, bot_username=get_bot_username())
+        except Exception as card_err:
+            log_error(f"Ошибка рендера карточки профиля: {card_err}")
+
+        if consumed_mode == "pro":
+            limit_info = f"\n<i>PRO-сканов на сегодня: {get_pro_remaining_today(user_id, pro_tier)}/{daily_limit}</i>"
+        elif consumed_mode == "extra":
+            rem_limit, _, _, _ = get_user_access(user_id)
+            limit_info = f"\n<i>Списан доп. скан из пакета (осталось доп.: {rem_limit})</i>"
+        else:
+            limit_info = ""
+
+        delete_status_safe(chat_id, status_msg)
+        sent_file_id = _send_report_card_or_text(
+            chat_id, card_bytes, profile_data["summary_text"], full_text, photo_hash,
+            verdict=profile_data.get("verdict", ""), limit_info=limit_info, is_profile=True,
+        )
+        scan_completed = True
+        cache_put(photo_hash, profile_data["summary_text"], full_text, card_image=card_bytes, card_file_id=sent_file_id)
+        record_user_scan_stats(user_id, score=None)
+
+    except Exception as e:
+        log_error(f"Ошибка в process_profile_photo: {e}")
+        if not scan_completed:
+            refund_profile_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, "⏳ Произошёл технический сбой. Попробуй ещё раз.")
     finally:
         gc.collect()
 
@@ -3655,7 +3119,19 @@ def handle_photo(message):
     if is_admin(user_id) and _prepare_broadcast_preview(message):
         return
 
-    pending_plan_id = pop_awaiting_receipt(user_id)
+    pending_plan_id, receipt_expired = pop_awaiting_receipt(user_id)
+    if receipt_expired:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("💎 Открыть тарифы", callback_data="buy_menu"))
+        bot.send_message(
+            message.chat.id,
+            "⏳ <b>Время ожидания чека истекло (30 мин).</b>\n"
+            "Чтобы отправить чек, выбери тариф заново через меню ниже — фото не отправлено на скан.",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return
+
     if pending_plan_id:
         if message.content_type == "document" and not is_receipt_document(message):
             set_awaiting_receipt(user_id, pending_plan_id)
@@ -3664,7 +3140,18 @@ def handle_photo(message):
         handle_receipt_submission(message, pending_plan_id)
         return
 
-    is_profile_mode = pop_awaiting_profile(user_id)
+    is_profile_mode, profile_expired = pop_awaiting_profile(user_id)
+    if profile_expired:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("📐 Включить режим профиля", callback_data="profile_scan"))
+        bot.send_message(
+            message.chat.id,
+            "⏳ <b>Режим анализа бокового профиля истёк (30 мин).</b>\n"
+            "Нажми кнопку ниже и отправь фото заново, чтобы оно не пошло как скан анфас.",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return
 
     if message.content_type == "document" and not is_image_document(message):
         if is_profile_mode:
