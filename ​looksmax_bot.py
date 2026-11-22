@@ -2088,7 +2088,8 @@ def notify_admins_once(alert_key, text):
 
 
 def call_gemini_api(api_key, model_name, image_bytes, prompt):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+    url = f"https://adonis-bot.godjo2satoru.workers.dev/v1beta/models/{model_name}:generateContent"
+
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key.strip()}
     payload = {
         "contents": [
