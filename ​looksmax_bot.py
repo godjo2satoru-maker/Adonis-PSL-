@@ -5857,4 +5857,13664 @@ if __name__ == "__main__":
             break
         except Exception as e:
             log_error(f"Сбой polling, перезапуск через 5 сек: {e}")
+            time.sleep(5)_media_group_lock = threading.Lock()
+_seen_media_groups = {}
+
+
+def _is_duplicate_media_group(user_id, media_group_id):
+    if not media_group_id:
+        return False
+    now = time.time()
+    key = (user_id, str(media_group_id))
+    with _media_group_lock:
+        if len(_seen_media_groups) > 500:
+            cutoff = now - 60.0
+            stale = [k for k, ts in _seen_media_groups.items() if ts < cutoff]
+            for k in stale:
+                del _seen_media_groups[k]
+        if key in _seen_media_groups and (now - _seen_media_groups[key]) < 30.0:
+            return True
+        _seen_media_groups[key] = now
+        return False
+
+
+def send_status_safe(message, text):
+    try:
+        return bot.reply_to(message, text)
+    except Exception:
+        try:
+            return bot.send_message(message.chat.id, text)
+        except Exception as e:
+            log_error(f"Не удалось отправить статус: {e}")
+            return None
+
+
+def delete_status_safe(chat_id, status_msg):
+    if not status_msg:
+        return
+    try:
+        bot.delete_message(chat_id, status_msg.message_id)
+    except Exception:
+        pass
+
+
+def safe_answer(call_id, text=None, show_alert=False):
+    try:
+        bot.answer_callback_query(call_id, text, show_alert=show_alert)
+    except Exception as e:
+        log_error(f"answer_callback_query: {e}")
+
+
+def edit_or_send(chat_id, text, reply_markup=None, message_id=None, parse_mode="HTML"):
+    if message_id:
+        try:
+            bot.edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=message_id,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+            return
+        except Exception as e:
+            if "message is not modified" in str(e).lower():
+                return
+    bot.send_message(
+        chat_id,
+        text,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True,
+    )
+
+
+def send_long_html(chat_id, title, text, limit=3500):
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if current and len(current) + len(line) + 1 > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
+
+    for i, chunk in enumerate(chunks):
+        header = f"<b>{html.escape(title)}</b>\n\n" if i == 0 else ""
+        try:
+            bot.send_message(chat_id, header + html.escape(chunk), parse_mode="HTML")
+        except Exception:
+            plain = f"{title}\n\n{chunk}" if i == 0 else chunk
+            bot.send_message(chat_id, plain, parse_mode=None)
+
+
+def is_image_document(message):
+    doc = getattr(message, "document", None)
+    if not doc:
+        return False
+    mime = (doc.mime_type or "").lower()
+    fname = (doc.file_name or "").lower()
+    return mime.startswith("image/") or fname.endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp"))
+
+
+def is_receipt_document(message):
+    if is_image_document(message):
+        return True
+    doc = getattr(message, "document", None)
+    if not doc:
+        return False
+    mime = (doc.mime_type or "").lower()
+    fname = (doc.file_name or "").lower()
+    return mime == "application/pdf" or fname.endswith(".pdf")
+
+
+def download_and_process_photo(message):
+    if message.photo:
+        file_obj = message.photo[-1]
+    elif message.document:
+        file_obj = message.document
+    else:
+        raise ValueError("Пришли фото лица.")
+
+    if (getattr(file_obj, "file_size", 0) or 0) > MAX_IMAGE_FILE_SIZE:
+        raise ValueError("Файл слишком большой (максимум 15 МБ).")
+
+    file_info = bot.get_file(file_obj.file_id)
+    if (file_info.file_size or 0) > MAX_IMAGE_FILE_SIZE:
+        raise ValueError("Файл слишком большой (максимум 15 МБ).")
+
+    raw_bytes = bot.download_file(file_info.file_path)
+    try:
+        with io.BytesIO(raw_bytes) as in_buf, Image.open(in_buf) as img:
+            img = ImageOps.exif_transpose(img)
+            if img.width < 64 or img.height < 64:
+                raise ValueError("Изображение слишком маленькое. Пришли чёткое фото лица.")
+            rgb = img.convert("RGB")
+            rgb.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+            with io.BytesIO() as out_buf:
+                rgb.save(out_buf, format="JPEG", quality=90, optimize=True)
+                return out_buf.getvalue()
+    except ValueError:
+        raise
+    except Image.DecompressionBombError:
+        raise ValueError("Изображение имеет слишком высокое разрешение.")
+    except Exception:
+        raise ValueError("Не удалось прочитать изображение. Пришли обычный JPG или PNG.")
+
+
+def setup_bot_commands():
+    default_commands = [
+        BotCommand("start", "Главное меню"),
+        BotCommand("buy", "Тарифы и сканы"),
+        BotCommand("ref", "Пригласить друга (+1 скан)"),
+        BotCommand("scale", "Шкала PSL 1.0–8.0"),
+        BotCommand("paysupport", "Поддержка"),
+    ]
+    admin_commands = default_commands + [
+        BotCommand("admin", "Шпаргалка по админке"),
+        BotCommand("model", "Сменить модель Gemini"),
+    ]
+    try:
+        bot.set_my_commands(default_commands, scope=BotCommandScopeDefault())
+        for admin_id in ADMIN_IDS:
+            bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
+    except Exception as e:
+        log_error(f"Не удалось выставить меню команд: {e}")
+
+
+def format_user_status_short(user_id):
+    free_limit, pro_tier, pro_until, _ = get_user_access(user_id)
+    if is_admin(user_id):
+        return "👑 <b>Администратор</b> • без лимитов"
+    extra_str = f" (+{free_limit} доп.)" if free_limit > 0 else ""
+    if pro_tier >= 2:
+        left = get_pro_remaining_today(user_id, pro_tier)
+        return f"💎 <b>PRO Навсегда</b> • сегодня {left}/{PRO_LIFE_DAILY_LIMIT}{extra_str}"
+    if pro_tier == 1:
+        left = get_pro_remaining_today(user_id, pro_tier)
+        until_str = format_date_from_ts(pro_until) if pro_until > 0 else "—"
+        return f"👑 <b>PRO до {until_str}</b> • сегодня {left}/{PRO30_DAILY_LIMIT}{extra_str}"
+    return f"⚡ <b>Базовый</b> • доступно сканов: <b>{free_limit}</b>"
+
+
+def format_score_delta(delta):
+    if delta is None:
+        return ""
+    if delta > 0.05:
+        return f"📈 +{delta:.1f} к прошлому скану"
+    if delta < -0.05:
+        return f"📉 {delta:.1f} к прошлому скану"
+    return "➖ без изменений к прошлому скану"
+
+
+def preview_score_delta(user_id, new_score):
+    if new_score is None:
+        return None
+    _, best_score, _, _, _, _, last_score, _ = get_user_profile_stats(user_id)
+    ref_score = last_score if last_score > 0.0 else best_score
+    if ref_score <= 0.0:
+        return None
+    return round(float(new_score) - float(ref_score), 1)
+
+
+def build_main_menu_view(user_id):
+    free_limit, pro_tier, _, _ = get_user_access(user_id)
+    status_line = format_user_status_short(user_id)
+    scans_cnt, best_score, _, _, _, _, last_score, prev_score = get_user_profile_stats(user_id)
+    best_line = f" • Лучший балл: <b>{best_score:.1f}/8</b>" if best_score > 0 else ""
+    delta_line = ""
+    if last_score > 0 and prev_score > 0:
+        d_txt = format_score_delta(round(last_score - prev_score, 1))
+        if d_txt:
+            delta_line = f"\nПоследний скан: <b>{last_score:.1f}/8</b> ({d_txt})"
+
+    sub_hint = ""
+    if (
+        not is_admin(user_id)
+        and pro_tier == 0
+        and free_limit <= 0
+        and is_channel_bonus_enabled()
+        and not is_channel_bonus_claimed(user_id)
+    ):
+        sub_hint = (
+            f"\n\n🎁 <b>Получи +{CHANNEL_SUB_BONUS} бесплатный скан:</b> "
+            "подпишись на наш канал кнопкой ниже!"
+        )
+
+    text = (
+        "<b>ADONIS PSL • Биометрия лица</b>\n\n"
+        f"<blockquote>{status_line}\n"
+        f"Сканов выполнено: <b>{scans_cnt}</b>{best_line}{delta_line}</blockquote>\n\n"
+        "Просто отправь <b>фото анфас</b> при ровном свете — бот замерит пропорции "
+        f"и соберёт карточку-отчёт по шкале 1.0–8.0.{sub_hint}"
+    )
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("📸 Анализ анфас", callback_data="scan_front_tip"),
+        InlineKeyboardButton("📐 Профиль (PRO)", callback_data="profile_scan"),
+    )
+    markup.add(
+        InlineKeyboardButton("👤 Мой профиль", callback_data="my_profile"),
+        InlineKeyboardButton("💎 Тарифы и сканы", callback_data="buy_menu"),
+    )
+    markup.add(
+        InlineKeyboardButton("🤝 Пригласить друга", callback_data="get_ref"),
+        InlineKeyboardButton("📖 Шкала PSL", callback_data="psl_scale"),
+    )
+    if is_channel_bonus_enabled() and not is_channel_bonus_claimed(user_id):
+        markup.add(
+            InlineKeyboardButton(
+                f"📢 +{CHANNEL_SUB_BONUS} скан за подписку",
+                callback_data="channel_bonus",
+            ),
+            InlineKeyboardButton("🆘 Поддержка", callback_data="support_menu"),
+        )
+    else:
+        markup.add(InlineKeyboardButton("🆘 Поддержка", callback_data="support_menu"))
+    return text, markup
+
+
+def build_psl_scale_view():
+    text = (
+        "<b>📖 Шкала PSL (1.0–8.0)</b>\n\n"
+        "<blockquote>"
+        "• <b>1.0–2.4</b> — <b>Саб 3</b> <i>(нижние ~5%)</i>\n"
+        "• <b>2.5–2.9</b> — <b>Саб 5</b> <i>(ниже среднего)</i>\n"
+        "• <b>3.0–3.4</b> — <b>Лтн</b> <i>(нижняя граница нормы)</i>\n"
+        "• <b>3.5–3.9</b> — <b>Мтн</b> <i>(средняя норма, ~50-й процентиль)</i>\n"
+        "• <b>4.0–4.4</b> — <b>Мхтн</b> <i>(выше среднего)</i>\n"
+        "• <b>4.5–4.9</b> — <b>Хмтн</b> <i>(верхние ~20%)</i>\n"
+        "• <b>5.0–5.4</b> — <b>Хтн</b> <i>(верхние ~10%)</i>\n"
+        "• <b>5.5–6.4</b> — <b>Лоу чад лайт</b> <i>(модельный уровень, топ ~3%)</i>\n"
+        "• <b>6.5–6.9</b> — <b>Чад лайт</b> <i>(сильный модельный, топ ~1%)</i>\n"
+        "• <b>7.0–8.0</b> — <b>Чад</b> <i>(элитный мировой уровень, топ &lt;0.2%)</i>"
+        "</blockquote>\n\n"
+        "<b>📸 Как получить точный замер:</b>\n"
+        "• Основная камера на уровне глаз с расстояния ~1–1.5 м (без широкоугольных искажений)\n"
+        "• Ровный фронтальный дневной свет, нейтральное лицо, без фильтров и очков"
+    )
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("📸 Сделать скан", callback_data="scan_front_tip"),
+        InlineKeyboardButton("👤 Мой профиль", callback_data="my_profile"),
+    )
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def build_profile_cabinet_view(user_id):
+    status_line = format_user_status_short(user_id)
+    scans_cnt, best_score, ref_count, _, _, _, last_score, prev_score = get_user_profile_stats(user_id)
+    best_str = f"<b>{best_score:.1f}/8</b> ({category_by_score(best_score)})" if best_score > 0 else "ещё нет"
+
+    last_line = ""
+    if last_score > 0:
+        delta_txt = format_score_delta(round(last_score - prev_score, 1)) if prev_score > 0 else ""
+        delta_part = f" • {delta_txt}" if delta_txt else ""
+        last_line = f"\nПоследний скан: <b>{last_score:.1f}/8</b>{delta_part}"
+
+    promo_code, discount_pct = get_user_active_discount(user_id)
+    promo_line = (
+        f"\nАктивный промокод: <code>{html.escape(promo_code)}</code> (<b>-{discount_pct}%</b>)"
+        if promo_code
+        else ""
+    )
+
+    uname = get_bot_username()
+    ref_block = (
+        f"\n🔗 Реф-ссылка:\n<code>https://t.me/{uname}?start=ref_{user_id}</code>"
+        if uname
+        else ""
+    )
+
+    text = (
+        "<b>👤 Мой профиль</b>\n\n"
+        f"<blockquote>{status_line}\n"
+        f"ID: <code>{user_id}</code>\n"
+        f"Всего сканов: <b>{scans_cnt}</b>\n"
+        f"Лучший результат: {best_str}{last_line}\n"
+        f"Приглашено друзей: <b>{ref_count}</b>{promo_line}</blockquote>"
+        f"{ref_block}"
+    )
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("💎 Пополнить / PRO", callback_data="buy_menu"),
+        InlineKeyboardButton("🎁 Промокод", callback_data="enter_promo"),
+    )
+    markup.add(
+        InlineKeyboardButton("🤝 Рефералка", callback_data="get_ref"),
+        InlineKeyboardButton("📖 Шкала PSL", callback_data="psl_scale"),
+    )
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def build_buy_menu_view(user_id=None):
+    promo_code, discount_pct = get_user_active_discount(user_id) if user_id is not None else ("", 0)
+    promo_banner = (
+        f"🎁 <b>Активна скидка -{discount_pct}%</b> по промокоду <code>{html.escape(promo_code)}</code>!\n\n"
+        if promo_code
+        else ""
+    )
+
+    lines = []
+    for plan_id, plan in PLANS.items():
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        if pr["discount_pct"] > 0:
+            price_txt = (
+                f"<s>{pr['orig_stars']} ⭐</s> <b>{pr['stars']} ⭐</b> / "
+                f"<s>{pr['orig_rub']} ₽</s> <b>{pr['rub']} ₽</b>"
+            )
+        else:
+            price_txt = f"{pr['stars']} ⭐ / {pr['rub']} ₽"
+
+        if plan_id == "pack15":
+            lines.append(f"• <b>{html.escape(plan['title'])}</b> — {price_txt} <i>(выгоднее)</i>")
+        elif plan_id == "pro30":
+            lines.append(
+                f"• <b>{html.escape(plan['title'])}</b> — {price_txt}\n"
+                f"  <i>{PRO30_DAILY_LIMIT} сканов/день + профиль + план роста + приоритет</i>"
+            )
+        elif plan_id == "pro_life":
+            lines.append(
+                f"• <b>{html.escape(plan['title'])}</b> — {price_txt}\n"
+                f"  <i>{PRO_LIFE_DAILY_LIMIT} сканов/день + профиль + план роста + топ-приоритет</i>"
+            )
+        else:
+            lines.append(f"• <b>{html.escape(plan['title'])}</b> — {price_txt}")
+
+    text = (
+        "<b>💎 Тарифы и сканы</b>\n\n"
+        f"{promo_banner}"
+        "<blockquote>" + "\n".join(lines) + "</blockquote>\n\n"
+        "Оплата через <b>Telegram Stars</b> активируется мгновенно."
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    for plan_id, plan in PLANS.items():
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        disc_tag = f" (-{pr['discount_pct']}%)" if pr["discount_pct"] > 0 else ""
+        markup.add(
+            InlineKeyboardButton(
+                f"{plan['title']} — {pr['stars']} ⭐ / {pr['rub']} ₽{disc_tag}",
+                callback_data=f"plan_{plan_id}",
+            )
+        )
+    markup.add(InlineKeyboardButton("🎁 Ввести промокод", callback_data="enter_promo"))
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def _build_progress_bar(current, target, width=10):
+    ratio = max(0.0, min(1.0, current / max(1, target)))
+    filled = int(round(ratio * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+def build_ref_view(user_id):
+    username = get_bot_username()
+    if not username:
+        return "⏳ Не удалось сформировать ссылку. Попробуй через пару секунд.", InlineKeyboardMarkup()
+
+    _, _, ref_count, _, _, _, _, _ = get_user_profile_stats(user_id)
+    ref_link = f"https://t.me/{username}?start=ref_{user_id}"
+    share_text = "Оцени внешность по 8-балльной шкале в Adonis PSL:"
+    share_url = f"https://t.me/share/url?url={quote(ref_link)}&text={quote(share_text)}"
+
+    ladder_lines = []
+    next_target = None
+    for req_refs, pro_days in REF_MILESTONES:
+        if ref_count >= req_refs:
+            ladder_lines.append(f"✅ <b>{req_refs} друзей</b> → PRO на {pro_days} дн.")
+        else:
+            if next_target is None:
+                next_target = (req_refs, pro_days)
+            ladder_lines.append(f"🔒 <b>{req_refs} друзей</b> → PRO на {pro_days} дн.")
+
+    if next_target:
+        req_refs, pro_days = next_target
+        bar = _build_progress_bar(ref_count, req_refs, width=10)
+        left = req_refs - ref_count
+        progress_txt = (
+            f"\nДо <b>PRO на {pro_days} дн.</b>: <code>[{bar}]</code> "
+            f"<b>{ref_count}/{req_refs}</b> (осталось {left})"
+        )
+    else:
+        progress_txt = "\n🏆 <b>Все ступени реферальной лестницы пройдены!</b>"
+
+    text = (
+        "<b>🤝 Пригласить друга</b>\n\n"
+        f"<blockquote>За каждого нового пользователя по твоей ссылке начисляется "
+        f"<b>+{REFERRAL_BONUS} бесплатный скан</b>.\n"
+        f"Приглашено друзей: <b>{ref_count}</b>{progress_txt}</blockquote>\n\n"
+        "<b>🏆 Реферальная лестница:</b>\n"
+        + "\n".join(ladder_lines)
+        + f"\n\nТвоя ссылка (нажми, чтобы скопировать):\n<code>{html.escape(ref_link)}</code>"
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("📤 Поделиться ссылкой", url=share_url))
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def build_channel_bonus_view():
+    url = get_channel_url()
+    text = (
+        f"<b>📢 Бонус +{CHANNEL_SUB_BONUS} бесплатный скан</b>\n\n"
+        "<blockquote>Подпишись на наш официальный Telegram-канал с обновлениями, разборами и промокодами, "
+        "затем нажми кнопку проверки ниже.</blockquote>"
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    if url:
+        markup.add(InlineKeyboardButton("📣 Перейти в канал", url=url))
+    markup.add(InlineKeyboardButton("✅ Проверить подписку", callback_data="check_sub"))
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def build_support_view():
+    support_url = get_support_url()
+    text = (
+        "<b>🆘 Поддержка</b>\n\n"
+        "<blockquote>Оплата через Telegram Stars начисляется автоматически за 1 секунду. "
+        "Перевод на карту (только РФ) подтверждается администратором после проверки чека.</blockquote>\n\n"
+        "Если возник вопрос по оплате или работе бота — напиши напрямую администратору:"
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    if support_url:
+        markup.add(InlineKeyboardButton("💬 Написать администратору", url=support_url))
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def send_adult_confirm(chat_id):
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("✅ Мне есть 18 лет", callback_data="confirm_18"))
+    bot.send_message(
+        chat_id,
+        "Доступ к оценке внешности разрешён только пользователям 18+.\n"
+        "Подтверди свой возраст кнопкой ниже:",
+        reply_markup=markup,
+    )
+
+
+def parse_referrer_id(text):
+    parts = (text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    m = re.match(r"^ref_(\d+)$", parts[1].strip())
+    return int(m.group(1)) if m else None
+
+
+def parse_start_promo(text):
+    parts = (text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    m = re.match(r"^promo_([A-Za-z0-9_\-]{2,24})$", parts[1].strip())
+    return m.group(1).upper() if m else None
+
+
+@bot.message_handler(commands=["start"])
+def cmd_start(message):
+    user_id = message.from_user.id
+    clear_pending_modes(user_id)
+    if is_user_banned(user_id):
+        bot.send_message(message.chat.id, "⛔ Доступ к боту ограничен.")
+        return
+    if not check_rate_limit(user_id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+
+    referrer_id = parse_referrer_id(message.text)
+    start_promo = parse_start_promo(message.text)
+    rewarded_referrer, milestone_msg = register_user_if_new(message.from_user, referrer_id=referrer_id)
+    if rewarded_referrer:
+        try:
+            ref_notice = (
+                f"🎉 По твоей ссылке присоединился новый пользователь!\n"
+                f"Начислен бонус: <b>+{REFERRAL_BONUS} бесплатный скан</b>."
+            )
+            if milestone_msg:
+                ref_notice += f"\n\n{milestone_msg}"
+            bot.send_message(rewarded_referrer, ref_notice, parse_mode="HTML")
+        except Exception as e:
+            log_error(f"Не удалось уведомить реферера {rewarded_referrer}: {e}")
+
+    if start_promo:
+        _, _, promo_msg = activate_promocode_for_user(user_id, start_promo)
+        bot.send_message(message.chat.id, promo_msg, parse_mode="HTML")
+
+    _, _, _, is_adult = get_user_access(user_id)
+    text, markup = build_main_menu_view(user_id)
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+    if not is_adult and not is_admin(user_id):
+        send_adult_confirm(message.chat.id)
+
+
+@bot.message_handler(commands=["buy"])
+def cmd_buy(message):
+    touch_user(message.from_user)
+    if is_user_banned(message.from_user.id):
+        return
+    if not check_rate_limit(message.from_user.id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+    clear_pending_modes(message.from_user.id)
+    text, markup = build_buy_menu_view(message.from_user.id)
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.message_handler(commands=["ref"])
+def cmd_ref(message):
+    touch_user(message.from_user)
+    if is_user_banned(message.from_user.id):
+        return
+    if not check_rate_limit(message.from_user.id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+    clear_pending_modes(message.from_user.id)
+    text, markup = build_ref_view(message.from_user.id)
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.message_handler(commands=["scale"])
+def cmd_scale(message):
+    touch_user(message.from_user)
+    if is_user_banned(message.from_user.id):
+        return
+    if not check_rate_limit(message.from_user.id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+    clear_pending_modes(message.from_user.id)
+    text, markup = build_psl_scale_view()
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.message_handler(commands=["paysupport"])
+def cmd_paysupport(message):
+    touch_user(message.from_user)
+    if is_user_banned(message.from_user.id):
+        return
+    if not check_rate_limit(message.from_user.id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+    clear_pending_modes(message.from_user.id)
+    text, markup = build_support_view()
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+
+def get_admin_help_text():
+    return (
+        "<b>👑 Админ-команды (через точку)</b>\n\n"
+        "<blockquote>"
+        "• <code>. создать промокод 10% ADONIS 50 24ч</code> — создать промо\n"
+        "  <i>Награда: 10% / 2скана / 3pro | лимит и время (30м/24ч/7д) опц.</i>\n"
+        "• <code>. промокоды</code> — список промокодов и активаций\n"
+        "• <code>. удалить промокод ADONIS</code> — отключить промокод\n"
+        "• <code>. выдать всем 1</code> — выдать +N сканов всем пользователям\n"
+        "• <code>. забрать у всех 1</code> / <code>все</code> — списать N (или все) сканы у всех\n"
+        "• <code>. забрать стартовый</code> — забрать 1 неиспользованный старт-скан у новичков\n"
+        "• <code>. выдать сканы @user 10</code> / <code>. забрать сканы @user 5</code>\n"
+        "• <code>. выдать премиум @user 30</code> / <code>навсегда</code>\n"
+        "• <code>. забрать премиум @user</code> — снять PRO\n"
+        "• <code>. модель</code> — меню смены модели Gemini (или <code>. модель имя</code>)\n"
+        "• <code>. стата</code> — сводка по боту (+ сканы за сегодня)\n"
+        "• <code>. юзеры [15]</code> — последние пользователи и их активность\n"
+        "• <code>. инфо @user</code> — досье по юзеру\n"
+        "• <code>. рассылка</code> — рассылка с предпросмотром\n"
+        "• <code>. бан @user</code> / <code>. разбан @user</code>\n"
+        "• <code>. очистить кэш</code> — сбросить кэш фото\n"
+        "• <code>. админ</code> — эта шпаргалка"
+        "</blockquote>\n\n"
+        "Вместо <code>@user</code> можно указывать числовой <code>ID</code>."
+    )
+
+
+def build_model_manager_view():
+    active = get_active_models()
+    active_str = "\n".join(f"• <code>{html.escape(m)}</code>" for m in active)
+    text = (
+        "<b>🤖 Управление моделью Gemini</b>\n\n"
+        f"<blockquote>Активная сейчас:\n{active_str}</blockquote>\n\n"
+        "Выбери быстрый пресет кнопкой ниже, введи свою модель вручную "
+        "или напиши команду:\n"
+        "<code>. модель gemini-3.5-flash-lite</code>\n"
+        "<i>Можно указать несколько через запятую (запасной фолбэк).</i>"
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    for preset in PRESET_MODELS:
+        prefix = "✅ " if active == [preset] else ""
+        markup.add(InlineKeyboardButton(f"{prefix}{preset}", callback_data=f"setmodel_{preset}"))
+    markup.add(InlineKeyboardButton("✏️ Ввести свою модель", callback_data="model_custom"))
+    markup.add(InlineKeyboardButton("🔄 Сбросить паузу 404/429", callback_data="model_reset_cd"))
+    markup.add(InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
+    return text, markup
+
+
+def get_bot_stats_text():
+    now = int(time.time())
+    today = get_today_str()
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        total = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE date(created_at, 'localtime') = ?", (today,))
+        new_today = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(pro_tier, 0) = 1 AND pro_until > ?", (now,))
+        pro30_cnt = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(pro_tier, 0) >= 2")
+        pro_life_cnt = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(is_banned, 0) = 1")
+        banned_cnt = c.fetchone()[0]
+        c.execute("SELECT COALESCE(SUM(scans_count), 0), COALESCE(SUM(referrals_count), 0) FROM users")
+        total_scans, total_refs = c.fetchone()
+        c.execute("SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM stars_payments")
+        stars_cnt, stars_sum = c.fetchone()
+        c.execute("SELECT COUNT(*) FROM payment_requests WHERE status = 'approved'")
+        card_cnt = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM photo_cache")
+        cached = c.fetchone()[0]
+        c.execute("SELECT COALESCE(scans, 0) FROM daily_stats WHERE day = ?", (today,))
+        row_today = c.fetchone()
+        scans_today = row_today[0] if row_today else 0
+        c.execute(
+            """
+            SELECT COUNT(*) FROM promocodes
+            WHERE is_active = 1
+              AND (expires_at = 0 OR expires_at > ?)
+              AND (max_uses = 0 OR used_count < max_uses)
+            """,
+            (now,),
+        )
+        active_promos = c.fetchone()[0]
+
+    mp_status = "✅ активен" if is_mediapipe_available() else "⚠️ визуальный режим"
+    models_str = ", ".join(get_active_models())
+    return (
+        "<b>📊 Статистика ADONIS PSL</b>\n\n"
+        "<blockquote>"
+        f"Пользователей: <b>{total}</b> (новых сегодня: <b>+{new_today}</b>)\n"
+        f"PRO 30д: <b>{pro30_cnt}</b> | PRO Навсегда: <b>{pro_life_cnt}</b> | Бан: <b>{banned_cnt}</b>\n"
+        f"Всего сканов: <b>{total_scans}</b> (сегодня: <b>+{scans_today}</b>) | Рефералов: <b>{total_refs}</b>\n"
+        f"Stars: <b>{stars_cnt}</b> ({stars_sum} ⭐) | Картой: <b>{card_cnt}</b>\n"
+        f"Очередь: <b>{_scan_queue.qsize()}</b> | Кэш фото: <b>{cached}</b> | Промо: <b>{active_promos}</b>\n"
+        f"Модели: <code>{html.escape(models_str)}</code>\n"
+        f"MediaPipe 468 точек: <b>{mp_status}</b>"
+        "</blockquote>"
+    )
+
+
+def build_user_dossier_text(target_id):
+    free_limit, pro_tier, pro_until, is_adult = get_user_access(target_id)
+    scans_cnt, best_score, ref_count, uname, fname, banned, last_score, prev_score = get_user_profile_stats(target_id)
+
+    extra_str = f" + {free_limit} доп." if free_limit > 0 else ""
+    if pro_tier >= 2:
+        tier_str = f"💎 PRO Навсегда (сегодня {get_pro_remaining_today(target_id, pro_tier)}/{PRO_LIFE_DAILY_LIMIT}{extra_str})"
+    elif pro_tier == 1:
+        tier_str = f"👑 PRO до {format_date_from_ts(pro_until)} (сегодня {get_pro_remaining_today(target_id, pro_tier)}/{PRO30_DAILY_LIMIT}{extra_str})"
+    else:
+        tier_str = f"⚡ Базовый (сканов: {free_limit})"
+
+    uname_str = f"@{uname}" if uname else "нет"
+    ban_str = "⛔ Забанен" if banned else "✅ Активен"
+    best_str = f"{best_score:.1f}/8" if best_score > 0 else "—"
+    last_str = f"{last_score:.1f}/8" if last_score > 0 else "—"
+    if last_score > 0 and prev_score > 0:
+        d = round(last_score - prev_score, 1)
+        last_str += f" ({d:+.1f})"
+
+    return (
+        f"<b>🗂 Досье пользователя</b>\n\n"
+        "<blockquote>"
+        f"ID: <code>{target_id}</code>\n"
+        f"Username: {html.escape(uname_str)}\n"
+        f"Имя: {html.escape(fname or '—')}\n"
+        f"Статус: {ban_str} | 18+: {'да' if is_adult else 'нет'}\n"
+        f"Тариф: {tier_str}\n"
+        f"Сканов всего: <b>{scans_cnt}</b> | Лучший: <b>{best_str}</b> | Последний: <b>{last_str}</b>\n"
+        f"Рефералов: <b>{ref_count}</b>"
+        "</blockquote>"
+    )
+
+
+@bot.message_handler(commands=["admin"])
+def cmd_admin_slash(message):
+    if is_admin(message.from_user.id):
+        bot.reply_to(message, get_admin_help_text(), parse_mode="HTML")
+
+
+@bot.message_handler(commands=["model", "models"])
+def cmd_model_slash(message):
+    if not is_admin(message.from_user.id):
+        return
+    clear_pending_modes(message.from_user.id)
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 2 and parts[1].strip():
+        arg = parts[1].strip()
+        if arg.lower() in ("сброс", "reset", "default"):
+            saved = set_active_models(DEFAULT_MODELS)
+            bot.reply_to(
+                message,
+                f"✅ Модель сброшена на стандартную: <code>{html.escape(', '.join(saved))}</code>",
+                parse_mode="HTML",
+            )
+            return
+        parsed = parse_models_input(arg)
+        if not parsed:
+            bot.reply_to(
+                message,
+                "⚠️ Некорректное имя модели. Пример: <code>/model gemini-3.5-flash-lite</code>",
+                parse_mode="HTML",
+            )
+            return
+        saved = set_active_models(parsed)
+        bot.reply_to(
+            message,
+            f"✅ Активная модель обновлена:\n<code>{html.escape(', '.join(saved))}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    text, markup = build_model_manager_view()
+    bot.reply_to(message, text, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.message_handler(commands=["stats"])
+def cmd_stats_slash(message):
+    if is_admin(message.from_user.id):
+        bot.reply_to(message, get_bot_stats_text(), parse_mode="HTML")
+
+
+@bot.message_handler(commands=["clear_cache"])
+def cmd_clear_cache_slash(message):
+    if not is_admin(message.from_user.id):
+        return
+    with db_conn() as conn:
+        conn.cursor().execute("DELETE FROM photo_cache")
+    bot.reply_to(message, "✅ Кэш фото очищен.")
+
+
+@bot.message_handler(
+    func=lambda m: bool(
+        m.text
+        and m.text.lstrip().startswith(".")
+        and is_admin(m.from_user.id)
+        and not is_awaiting_broadcast(m.from_user.id)
+        and not is_awaiting_model(m.from_user.id)
+        and not is_awaiting_promo(m.from_user.id)
+    ),
+    content_types=["text"],
+)
+def handle_admin_dot_commands(message):
+    user_id = message.from_user.id
+    body = re.sub(r"\s+", " ", message.text.lstrip()[1:].strip())
+    low = body.lower()
+
+    if low in ("админ", "admin", "помощь", "help"):
+        bot.reply_to(message, get_admin_help_text(), parse_mode="HTML")
+        return
+
+    if low in ("стата", "статистика", "stats"):
+        bot.reply_to(message, get_bot_stats_text(), parse_mode="HTML")
+        return
+
+    m_users = re.match(r"^(?:юзеры|пользователи|users)(?:\s+(\d+))?$", body, flags=re.IGNORECASE)
+    if m_users:
+        lim = max(1, min(30, int(m_users.group(1)))) if m_users.group(1) else 15
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                """
+                SELECT user_id, COALESCE(username, ''), COALESCE(first_name, ''),
+                       COALESCE(free_limit, 0), COALESCE(pro_tier, 0),
+                       COALESCE(scans_count, 0), COALESCE(best_score, 0.0)
+                FROM users
+                ORDER BY created_at DESC, user_id DESC
+                LIMIT ?
+                """,
+                (lim,),
+            )
+            rows = c.fetchall()
+        if not rows:
+            bot.reply_to(message, "Пользователей пока нет.")
+            return
+        lines = []
+        for uid, uname, fname, flim, ptier, scnt, bscore in rows:
+            tag = f"@{uname}" if uname else (fname or str(uid))
+            tier_icon = "💎" if ptier >= 2 else ("👑" if ptier == 1 else "⚡")
+            score_part = f" | max {bscore:.1f}" if bscore > 0 else ""
+            lines.append(
+                f"{tier_icon} <code>{uid}</code> ({html.escape(tag[:20])}) — "
+                f"баланс: <b>{flim}</b> | сканов: <b>{scnt}</b>{score_part}"
+            )
+        bot.reply_to(
+            message,
+            f"<b>👥 Последние {len(rows)} пользователей</b>\n\n<blockquote>" + "\n".join(lines) + "</blockquote>",
+            parse_mode="HTML",
+        )
+        return
+
+    m_give_all = re.match(
+        r"^выдать\s+всем(?:\s+(?:сканы|сканов|рейты|рейтов))?\s+(\d+)$",
+        body,
+        flags=re.IGNORECASE,
+    )
+    if m_give_all:
+        amount = int(m_give_all.group(1))
+        if amount <= 0 or amount > 1000:
+            bot.reply_to(message, "⚠️ Укажи число от 1 до 1000.")
+            return
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                "UPDATE users SET free_limit = free_limit + ? WHERE COALESCE(is_banned, 0) = 0",
+                (amount,),
+            )
+            affected = c.rowcount
+        bot.reply_to(
+            message,
+            f"✅ Выдано <b>+{amount} сканов</b> всем активным пользователям (затронуто: <b>{affected}</b>).",
+            parse_mode="HTML",
+        )
+        return
+
+    m_take_all = re.match(
+        r"^(?:забрать\s+у\s+всех|списать\s+у\s+всех)(?:\s+(?:сканы|сканов|рейты|рейтов))?\s+(\S+)$",
+        body,
+        flags=re.IGNORECASE,
+    )
+    if m_take_all:
+        arg = m_take_all.group(1).lower()
+        if arg in ("все", "всё", "all", "0"):
+            with db_conn() as conn:
+                c = conn.cursor()
+                c.execute("UPDATE users SET free_limit = 0 WHERE free_limit > 0")
+                affected = c.rowcount
+            bot.reply_to(
+                message,
+                f"🗑 Все сканы (free_limit) обнулены у <b>{affected}</b> пользователей.",
+                parse_mode="HTML",
+            )
+            return
+        if not arg.isdigit() or int(arg) <= 0:
+            bot.reply_to(
+                message,
+                "⚠️ Укажи число (> 0) или слово <code>все</code>. Пример: <code>. забрать у всех 1</code>",
+                parse_mode="HTML",
+            )
+            return
+        amount = int(arg)
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                "UPDATE users SET free_limit = MAX(0, free_limit - ?) WHERE free_limit > 0",
+                (amount,),
+            )
+            affected = c.rowcount
+        bot.reply_to(
+            message,
+            f"✅ Списано до <b>-{amount} сканов</b> у всех пользователей с балансом (затронуто: <b>{affected}</b>).",
+            parse_mode="HTML",
+        )
+        return
+
+    if low in ("забрать стартовый", "снять стартовый"):
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                """
+                UPDATE users
+                SET free_limit = MAX(0, free_limit - 1)
+                WHERE free_limit > 0
+                  AND COALESCE(scans_count, 0) = 0
+                  AND COALESCE(pro_tier, 0) = 0
+                  AND COALESCE(channel_bonus_claimed, 0) = 0
+                  AND COALESCE(referrals_count, 0) = 0
+                """
+            )
+            affected = c.rowcount
+        bot.reply_to(
+            message,
+            f"✅ Неиспользованный стартовый скан списан у <b>{affected}</b> новичков "
+            "(подписчики ТГК, реферальные и купленные сканы не затронуты).",
+            parse_mode="HTML",
+        )
+        return
+
+    if low in ("очистить кэш", "кэш", "clear_cache"):
+        with db_conn() as conn:
+            conn.cursor().execute("DELETE FROM photo_cache")
+        bot.reply_to(message, "✅ Кэш фото очищен.")
+        return
+
+    if low in ("промокоды", "промо", "promos"):
+        rows = list_promocodes_db(limit=25)
+        if not rows:
+            bot.reply_to(
+                message,
+                "🎁 Промокодов пока нет.\n"
+                "Создать: <code>. создать промокод 10% ADONIS 50 24ч</code>",
+                parse_mode="HTML",
+            )
+            return
+        now = int(time.time())
+        lines = []
+        for code, ptype, val, max_u, used_c, exp_at, is_act in rows:
+            expired = bool(exp_at > 0 and now >= exp_at)
+            exhausted = bool(max_u > 0 and used_c >= max_u)
+            icon = "✅" if (is_act and not expired and not exhausted) else "⛔"
+            lim_str = f"{used_c}/{max_u}" if max_u > 0 else f"{used_c}/∞"
+            time_str = format_time_left(exp_at)
+            lines.append(
+                f"{icon} <code>{html.escape(code)}</code> — {format_promo_reward(ptype, val)} "
+                f"| {lim_str} | {time_str}"
+            )
+        bot.reply_to(
+            message,
+            "<b>🎁 Промокоды</b>\n\n<blockquote>" + "\n".join(lines) + "</blockquote>",
+            parse_mode="HTML",
+        )
+        return
+
+    m_del_promo = re.match(r"^(?:удалить|отключить)\s+промокод\s+(\S+)$", body, flags=re.IGNORECASE)
+    if m_del_promo:
+        code = m_del_promo.group(1).strip().upper()
+        if deactivate_promocode_db(code):
+            bot.reply_to(message, f"🗑 Промокод <code>{html.escape(code)}</code> отключён.", parse_mode="HTML")
+        else:
+            bot.reply_to(message, f"⚠️ Промокод <code>{html.escape(code)}</code> не найден.", parse_mode="HTML")
+        return
+
+    m_new_promo = re.match(r"^создать\s+промокод\s+(.+)$", body, flags=re.IGNORECASE)
+    if m_new_promo:
+        tokens = m_new_promo.group(1).strip().split()
+        if len(tokens) < 2:
+            bot.reply_to(
+                message,
+                "⚠️ Формат: <code>. создать промокод 10% ADONIS [лимит] [время]</code>\n"
+                "Примеры:\n"
+                "• <code>. создать промокод 10% ADONIS 50 24ч</code>\n"
+                "• <code>. создать промокод 2скана START 100 7д</code>\n"
+                "• <code>. создать промокод 3pro VIP 20</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        ptype, pval = parse_promo_reward_token(tokens[0])
+        if not ptype:
+            bot.reply_to(
+                message,
+                "⚠️ Некорректная награда. Укажи: <code>10%</code> (1–90%), <code>2скана</code> или <code>3pro</code>.",
+                parse_mode="HTML",
+            )
+            return
+
+        code = tokens[1].strip().upper()
+        if not re.fullmatch(r"[A-Z0-9_\-]{2,24}", code):
+            bot.reply_to(
+                message,
+                "⚠️ Код должен быть длиной 2–24 символа (только латиница, цифры, _ или -).",
+                parse_mode="HTML",
+            )
+            return
+
+        max_uses = 0
+        duration_sec = 0
+        for extra in tokens[2:]:
+            if extra.isdigit():
+                max_uses = int(extra)
+                continue
+            parsed_dur = parse_promo_duration_token(extra)
+            if parsed_dur is not None:
+                duration_sec = parsed_dur
+                continue
+            bot.reply_to(
+                message,
+                f"⚠️ Не понял параметр <code>{html.escape(extra)}</code>.\n"
+                "Лимит — число (например <code>50</code>), время — <code>30м</code>, <code>24ч</code> или <code>7д</code>.",
+                parse_mode="HTML",
+            )
+            return
+
+        expires_at = create_promocode_db(code, ptype, pval, max_uses=max_uses, duration_sec=duration_sec)
+        uname = get_bot_username()
+        link_line = (
+            f"\nСсылка автоактивации:\n<code>https://t.me/{uname}?start=promo_{code}</code>"
+            if uname
+            else ""
+        )
+        lim_txt = f"{max_uses} активаций" if max_uses > 0 else "безлимит"
+        exp_txt = f"до {format_datetime_from_ts(expires_at)} ({format_time_left(expires_at)})" if expires_at > 0 else "бессрочно"
+        bot.reply_to(
+            message,
+            f"✅ <b>Промокод создан!</b>\n\n"
+            f"<blockquote>Код: <code>{html.escape(code)}</code>\n"
+            f"Награда: <b>{format_promo_reward(ptype, pval)}</b>\n"
+            f"Лимит: <b>{lim_txt}</b>\n"
+            f"Срок: <b>{exp_txt}</b></blockquote>"
+            f"{link_line}",
+            parse_mode="HTML",
+        )
+        return
+
+    m_model = re.match(r"^(?:модель|модели|model|models)(?:\s+(.+))?$", body, flags=re.IGNORECASE)
+    if m_model:
+        clear_pending_modes(user_id)
+        arg = (m_model.group(1) or "").strip()
+        if not arg:
+            text, markup = build_model_manager_view()
+            bot.reply_to(message, text, parse_mode="HTML", reply_markup=markup)
+            return
+        if arg.lower() in ("сброс", "reset", "default"):
+            saved = set_active_models(DEFAULT_MODELS)
+            bot.reply_to(
+                message,
+                f"✅ Модель сброшена на стандартную: <code>{html.escape(', '.join(saved))}</code>",
+                parse_mode="HTML",
+            )
+            return
+        parsed = parse_models_input(arg)
+        if not parsed:
+            bot.reply_to(
+                message,
+                "⚠️ Некорректное название модели. Пример: <code>. модель gemini-3.5-flash-lite</code>",
+                parse_mode="HTML",
+            )
+            return
+        saved = set_active_models(parsed)
+        bot.reply_to(
+            message,
+            f"✅ Активная модель обновлена и сохранена:\n<code>{html.escape(', '.join(saved))}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    if low == "рассылка":
+        clear_pending_modes(user_id)
+        with _broadcast_lock:
+            _broadcast_state[user_id] = {"step": "await_content"}
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="bc_cancel"))
+        bot.reply_to(
+            message,
+            "📢 <b>Режим рассылки</b>\n\n"
+            "Отправь следующим сообщением <b>текст</b> или <b>фото с подписью</b>. "
+            "Я покажу предпросмотр с кнопкой подтверждения перед отправкой.",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return
+
+    m_grant = re.match(r"^выдать\s+премиум\s+(\S+)(?:\s+(\S+))?$", body, flags=re.IGNORECASE)
+    if m_grant:
+        target_id = resolve_target_user(m_grant.group(1))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе. Укажи ID или дождись, пока он напишет боту.")
+            return
+        dur_raw = (m_grant.group(2) or "навсегда").lower()
+        ensure_user(target_id)
+
+        if dur_raw in ("навсегда", "0", "life", "forever"):
+            with db_conn() as conn:
+                conn.cursor().execute(
+                    "UPDATE users SET is_premium = 1, pro_tier = 2, pro_until = 0 WHERE user_id = ?",
+                    (target_id,),
+                )
+            bot.reply_to(message, f"✅ Выдан <b>PRO Навсегда</b> для <code>{target_id}</code>.", parse_mode="HTML")
+            try:
+                bot.send_message(target_id, "💎 Тебе активирован <b>PRO Навсегда</b>!", parse_mode="HTML")
+            except Exception:
+                pass
+            return
+
+        if not dur_raw.isdigit() or int(dur_raw) <= 0:
+            bot.reply_to(message, "⚠️ Укажи число дней (> 0) или слово <code>навсегда</code>.", parse_mode="HTML")
+            return
+
+        days = int(dur_raw)
+        now = int(time.time())
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                "SELECT COALESCE(pro_tier, 0), COALESCE(pro_until, 0) FROM users WHERE user_id = ?",
+                (target_id,),
+            )
+            row = c.fetchone()
+            cur_tier = row[0] if row else 0
+            cur_until = row[1] if row else 0
+            if cur_tier >= 2:
+                bot.reply_to(
+                    message,
+                    f"ℹ️ У <code>{target_id}</code> уже активен <b>PRO Навсегда</b>. "
+                    "Чтобы снять его, используй <code>. забрать премиум</code>.",
+                    parse_mode="HTML",
+                )
+                return
+            base = max(now, cur_until) if cur_tier == 1 else now
+            until_ts = base + days * 86400
+            c.execute(
+                "UPDATE users SET is_premium = 1, pro_tier = 1, pro_until = ? WHERE user_id = ?",
+                (until_ts, target_id),
+            )
+        bot.reply_to(
+            message,
+            f"✅ Выдан <b>PRO на {days} дн.</b> (до {format_date_from_ts(until_ts)}) для <code>{target_id}</code>.",
+            parse_mode="HTML",
+        )
+        try:
+            bot.send_message(
+                target_id,
+                f"👑 Тебе активирован <b>PRO на {days} дн.</b> (до {format_date_from_ts(until_ts)})!",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return
+
+    m_rev = re.match(r"^забрать\s+премиум\s+(\S+)$", body, flags=re.IGNORECASE)
+    if m_rev:
+        target_id = resolve_target_user(m_rev.group(1))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        ensure_user(target_id)
+        with db_conn() as conn:
+            conn.cursor().execute(
+                "UPDATE users SET is_premium = 0, pro_tier = 0, pro_until = 0 WHERE user_id = ?",
+                (target_id,),
+            )
+        bot.reply_to(message, f"❌ PRO снят у <code>{target_id}</code>.", parse_mode="HTML")
+        return
+
+    m_scans = re.match(r"^выдать\s+сканы\s+(\S+)\s+(\d+)$", body, flags=re.IGNORECASE)
+    if m_scans:
+        target_id = resolve_target_user(m_scans.group(1))
+        amount = int(m_scans.group(2))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        if amount <= 0:
+            bot.reply_to(message, "⚠️ Количество сканов должно быть больше 0.")
+            return
+        ensure_user(target_id)
+        with db_conn() as conn:
+            conn.cursor().execute(
+                "UPDATE users SET free_limit = free_limit + ? WHERE user_id = ?",
+                (amount, target_id),
+            )
+        bot.reply_to(message, f"✅ Начислено <b>+{amount} сканов</b> юзеру <code>{target_id}</code>.", parse_mode="HTML")
+        try:
+            bot.send_message(target_id, f"⚡ Тебе начислено <b>+{amount} сканов</b> на баланс!", parse_mode="HTML")
+        except Exception:
+            pass
+        return
+
+    m_take_user = re.match(
+        r"^забрать\s+(?:сканы|рейты)\s+(\S+)\s+(\S+)$",
+        body,
+        flags=re.IGNORECASE,
+    )
+    if m_take_user:
+        target_id = resolve_target_user(m_take_user.group(1))
+        arg = m_take_user.group(2).lower()
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        ensure_user(target_id)
+        if arg in ("все", "всё", "all", "0"):
+            with db_conn() as conn:
+                conn.cursor().execute("UPDATE users SET free_limit = 0 WHERE user_id = ?", (target_id,))
+            bot.reply_to(message, f"🗑 Все сканы обнулены у <code>{target_id}</code>.", parse_mode="HTML")
+            return
+        if not arg.isdigit() or int(arg) <= 0:
+            bot.reply_to(message, "⚠️ Укажи число (> 0) или <code>все</code>.", parse_mode="HTML")
+            return
+        amount = int(arg)
+        with db_conn() as conn:
+            conn.cursor().execute(
+                "UPDATE users SET free_limit = MAX(0, free_limit - ?) WHERE user_id = ?",
+                (amount, target_id),
+            )
+        bot.reply_to(message, f"✅ Списано до <b>-{amount} сканов</b> у <code>{target_id}</code>.", parse_mode="HTML")
+        return
+
+    m_info = re.match(r"^инфо\s+(\S+)$", body, flags=re.IGNORECASE)
+    if m_info:
+        target_id = resolve_target_user(m_info.group(1))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        bot.reply_to(message, build_user_dossier_text(target_id), parse_mode="HTML")
+        return
+
+    m_ban = re.match(r"^(бан|разбан)\s+(\S+)$", body, flags=re.IGNORECASE)
+    if m_ban:
+        action = m_ban.group(1).lower()
+        target_id = resolve_target_user(m_ban.group(2))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        if is_admin(target_id):
+            bot.reply_to(message, "⚠️ Нельзя забанить администратора.")
+            return
+        ensure_user(target_id)
+        ban_val = 1 if action == "бан" else 0
+        with db_conn() as conn:
+            conn.cursor().execute("UPDATE users SET is_banned = ? WHERE user_id = ?", (ban_val, target_id))
+        msg = f"⛔ Пользователь <code>{target_id}</code> забанен." if ban_val else f"✅ Пользователь <code>{target_id}</code> разбанен."
+        bot.reply_to(message, msg, parse_mode="HTML")
+        return
+
+    bot.reply_to(message, "⚠️ Неизвестная команда. Напиши <code>. админ</code> для списка.", parse_mode="HTML")
+
+
+def _prepare_broadcast_preview(message):
+    user_id = message.from_user.id
+    with _broadcast_lock:
+        state = _broadcast_state.get(user_id)
+    if not state or state.get("step") != "await_content":
+        return False
+
+    if message.content_type == "photo":
+        payload = {
+            "step": "ready",
+            "type": "photo",
+            "file_id": message.photo[-1].file_id,
+            "caption": message.caption or "",
+        }
+    elif message.content_type == "text":
+        payload = {
+            "step": "ready",
+            "type": "text",
+            "text": message.text,
+        }
+    else:
+        bot.reply_to(message, "⚠️ Для рассылки отправь текст или фото с подписью.")
+        return True
+
+    with _broadcast_lock:
+        _broadcast_state[user_id] = payload
+
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(is_banned, 0) = 0")
+        total_targets = c.fetchone()[0]
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton(f"✅ Отправить ({total_targets})", callback_data="bc_send"),
+        InlineKeyboardButton("❌ Отмена", callback_data="bc_cancel"),
+    )
+
+    bot.send_message(message.chat.id, "👁 <b>Предпросмотр рассылки:</b>", parse_mode="HTML")
+    if payload["type"] == "photo":
+        bot.send_photo(message.chat.id, payload["file_id"], caption=payload["caption"], reply_markup=markup)
+    else:
+        bot.send_message(message.chat.id, payload["text"], reply_markup=markup)
+    return True
+
+
+def _send_broadcast_item(uid, payload):
+    if payload["type"] == "photo":
+        bot.send_photo(uid, payload["file_id"], caption=payload["caption"])
+    else:
+        bot.send_message(uid, payload["text"])
+
+
+def _run_broadcast_worker(admin_chat_id, payload):
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM users WHERE COALESCE(is_banned, 0) = 0")
+        user_ids = [row[0] for row in c.fetchall()]
+
+    ok_cnt, fail_cnt = 0, 0
+    for uid in user_ids:
+        sent = False
+        for attempt in range(2):
+            try:
+                _send_broadcast_item(uid, payload)
+                sent = True
+                break
+            except telebot.apihelper.ApiTelegramException as api_err:
+                if getattr(api_err, "error_code", None) == 429 and attempt == 0:
+                    retry_after = 3
+                    try:
+                        retry_after = int((api_err.result_json or {}).get("parameters", {}).get("retry_after", 3))
+                    except Exception:
+                        retry_after = 3
+                    time.sleep(min(max(1, retry_after), 60) + 0.5)
+                    continue
+                break
+            except Exception:
+                break
+        if sent:
+            ok_cnt += 1
+        else:
+            fail_cnt += 1
+        time.sleep(0.05)
+
+    try:
+        bot.send_message(
+            admin_chat_id,
+            f"📢 <b>Рассылка завершена!</b>\n"
+            f"Доставлено: <b>{ok_cnt}</b> | Ошибок/блок: <b>{fail_cnt}</b>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
+@bot.message_handler(
+    func=lambda m: is_admin(m.from_user.id) and is_awaiting_broadcast(m.from_user.id),
+    content_types=["text", "photo"],
+)
+def handle_admin_broadcast_input(message):
+    _prepare_broadcast_preview(message)
+
+
+@bot.message_handler(
+    func=lambda m: is_admin(m.from_user.id) and is_awaiting_model(m.from_user.id),
+    content_types=["text"],
+)
+def handle_admin_model_input(message):
+    user_id = message.from_user.id
+    parsed = parse_models_input(message.text)
+    if not parsed:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="model_cancel"))
+        bot.reply_to(
+            message,
+            "⚠️ Некорректное имя модели. Введи название латиницей, например:\n"
+            "<code>gemini-3.5-flash-lite</code>\n"
+            "<i>Или несколько моделей через запятую.</i>",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return
+
+    clear_awaiting_model(user_id)
+    saved = set_active_models(parsed)
+    text, markup = build_model_manager_view()
+    bot.reply_to(
+        message,
+        f"✅ Модель обновлена и сохранена: <code>{html.escape(', '.join(saved))}</code>\n\n{text}",
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
+
+
+def build_report_markup(photo_hash, include_profile_btn=True, is_profile=False):
+    markup = InlineKeyboardMarkup(row_width=2)
+    if photo_hash:
+        btn_label = "📊 Подробный разбор профиля" if is_profile else "📊 Подробный разбор"
+        markup.add(InlineKeyboardButton(btn_label, callback_data=f"full_{photo_hash}"))
+        if not is_profile:
+            markup.add(InlineKeyboardButton("📈 План роста (PRO)", callback_data=f"growth_{photo_hash}"))
+    row2 = []
+    if include_profile_btn and not is_profile:
+        row2.append(InlineKeyboardButton("📐 Профиль (PRO)", callback_data="profile_scan"))
+    row2.append(InlineKeyboardButton("📖 Шкала", callback_data="psl_scale_new"))
+    row2.append(InlineKeyboardButton("🏠 Меню", callback_data="main_menu_new"))
+    markup.add(*row2)
+    return markup
+
+
+def _run_growth_plan_worker(chat_id, user_id, photo_hash, scores_text, full_text, status_msg):
+    try:
+        report_context = f"{scores_text}\n\n{full_text}".strip()[:4500]
+        prompt = GROWTH_PLAN_PROMPT.format(report_context=report_context)
+        plan_text, _ = run_gemini_text_pipeline(prompt)
+        delete_status_safe(chat_id, status_msg)
+
+        if not plan_text:
+            bot.send_message(
+                chat_id,
+                "⏳ Не удалось сгенерировать план роста прямо сейчас — попробуй нажать кнопку через минуту.",
+            )
+            return
+
+        cache_set_growth_plan(photo_hash, plan_text)
+        send_long_html(chat_id, "📈 Персональный план роста (PRO)", plan_text)
+    except Exception as e:
+        log_error(f"Ошибка в _run_growth_plan_worker: {e}")
+        delete_status_safe(chat_id, status_msg)
+        bot.send_message(chat_id, "⏳ Технический сбой при генерации плана роста. Попробуй ещё раз.")
+    finally:
+        with _growth_busy_lock:
+            _growth_busy.discard((user_id, photo_hash))
+
+
+def _build_front_caption(scores_text, verdict="", limit_info="", delta_line=""):
+    score = extract_final_score(scores_text)
+    m_cat = re.search(r"(?im)^Категория[:\s]+(.+)$", scores_text)
+    cat = m_cat.group(1).strip() if m_cat else (category_by_score(score) if score else "")
+    head = (
+        f"<b>Результат: {score:.1f}/8 • {html.escape(cat)}</b>"
+        if score is not None
+        else "<b>Карточка анализа лица готова</b>"
+    )
+    delta_block = f"\n{html.escape(delta_line)}" if delta_line else ""
+    quote_block = f"\n<blockquote>{html.escape(verdict)}</blockquote>" if verdict else ""
+    return f"{head}{delta_block}{quote_block}{limit_info}"
+
+
+def _build_profile_caption(scores_text, verdict="", limit_info=""):
+    score = extract_final_score(scores_text)
+    m_cat = re.search(r"(?im)^Категория[:\s]+(.+)$", scores_text)
+    cat = m_cat.group(1).strip() if m_cat else (category_by_score(score) if score else "")
+    head = (
+        f"<b>📐 Профиль: {score:.1f}/8 • {html.escape(cat)}</b>"
+        if score is not None
+        else "<b>📐 Анализ бокового профиля готов</b>"
+    )
+    quote_block = f"\n<blockquote>{html.escape(verdict)}</blockquote>" if verdict else ""
+    return f"{head}{quote_block}{limit_info}"
+
+
+def _send_report_card_or_text(
+    chat_id,
+    card_bytes,
+    scores_text,
+    full_text,
+    photo_hash,
+    verdict="",
+    limit_info="",
+    delta_line="",
+    is_profile=False,
+    card_file_id="",
+):
+    markup = build_report_markup(
+        photo_hash if full_text else None,
+        include_profile_btn=not is_profile,
+        is_profile=is_profile,
+    )
+    if not verdict:
+        verdict = extract_verdict(scores_text)
+
+    caption = (
+        _build_profile_caption(scores_text, verdict=verdict, limit_info=limit_info)
+        if is_profile
+        else _build_front_caption(scores_text, verdict=verdict, limit_info=limit_info, delta_line=delta_line)
+    )
+
+    if card_file_id:
+        try:
+            bot.send_photo(chat_id, card_file_id, caption=caption, parse_mode="HTML", reply_markup=markup)
+            return card_file_id
+        except Exception as e:
+            log_error(f"Не удалось отправить карточку по file_id, пробую резерв: {e}")
+
+    if card_bytes:
+        try:
+            with io.BytesIO(card_bytes) as bio:
+                bio.name = "adonis_psl_card.jpg"
+                sent = bot.send_photo(chat_id, bio, caption=caption, parse_mode="HTML", reply_markup=markup)
+            if sent and getattr(sent, "photo", None):
+                return sent.photo[-1].file_id
+            return ""
+        except Exception as e:
+            log_error(f"Не удалось отправить карточку, шлю текстом: {e}")
+
+    title = "Анализ бокового профиля:" if is_profile else "Экспресс-оценка лица:"
+    delta_block = f"\n{html.escape(delta_line)}" if delta_line else ""
+    bot.send_message(
+        chat_id,
+        f"<b>{title}</b>{delta_block}\n\n<blockquote>{html.escape(scores_text)}</blockquote>{limit_info}",
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
+    return ""
+
+
+def _format_full_breakdown(full_text, geom=None):
+    parts = []
+    if geom and geom.get("metrics"):
+        title = "📐 Пропорции (468 точек лица):" if geom.get("source") == "mediapipe" else "📐 Пропорции лица:"
+        lines = [title]
+        for m in geom["metrics"]:
+            if m.get("display"):
+                lines.append(f"• {m['name']}: {m['display']} — {m['status']} ({m['norm']})")
+            else:
+                lines.append(f"• {m['name']}: {m['status']} ({m['norm']})")
+        lines.append(f"• Симметрия: {geom['symmetry_pct']:.1f}% — {geom['symmetry_status']}")
+        if geom.get("face_shape"):
+            lines.append(f"• Форма лица: {geom['face_shape']}")
+        parts.append("\n".join(lines))
+    if full_text:
+        parts.append(full_text.strip())
+    return "\n\n".join(parts)
+
+
+def _send_no_scans_prompt(chat_id, user_id=None):
+    has_sub_bonus = (
+        user_id is not None
+        and is_channel_bonus_enabled()
+        and not is_channel_bonus_claimed(user_id)
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    if has_sub_bonus:
+        markup.add(
+            InlineKeyboardButton(
+                f"📢 +{CHANNEL_SUB_BONUS} скан за подписку на канал",
+                callback_data="channel_bonus",
+            )
+        )
+    markup.add(InlineKeyboardButton(f"🤝 Пригласить друга (+{REFERRAL_BONUS} скан)", callback_data="get_ref"))
+    markup.add(InlineKeyboardButton("💎 Купить сканы / PRO", callback_data="buy_menu"))
+    markup.add(InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
+
+    if has_sub_bonus:
+        msg = (
+            "❌ <b>На балансе нет доступных сканов.</b>\n\n"
+            f"Подпишись на наш канал (+{CHANNEL_SUB_BONUS} бесплатный скан), "
+            f"пригласи друга (+{REFERRAL_BONUS} скан) или выбери тариф:"
+        )
+    else:
+        msg = (
+            "❌ <b>Бесплатные сканы исчерпаны.</b>\n\n"
+            f"Пригласи друга по ссылке (+{REFERRAL_BONUS} скан) или выбери тариф:"
+        )
+    bot.send_message(chat_id, msg, parse_mode="HTML", reply_markup=markup)
+
+
+def _send_pro_daily_limit_prompt(chat_id, daily_limit):
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("⚡ Докупить пакет сканов", callback_data="buy_menu"))
+    markup.add(InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
+    bot.send_message(
+        chat_id,
+        f"⏳ <b>Дневной лимит PRO исчерпан ({daily_limit}/{daily_limit}).</b>\n"
+        "Лимит обновится завтра в 00:00, либо можно докупить пакет дополнительных сканов:",
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
+
+
+def process_adult_photo(message, status_msg=None):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    free_limit, pro_tier, _, _ = get_user_access(user_id)
+    admin_user = is_admin(user_id)
+    daily_limit = get_pro_daily_limit_for_tier(pro_tier)
+
+    if not admin_user:
+        if pro_tier > 0:
+            if get_pro_remaining_today(user_id, pro_tier) <= 0 and free_limit <= 0:
+                delete_status_safe(chat_id, status_msg)
+                _send_pro_daily_limit_prompt(chat_id, daily_limit)
+                return
+        elif free_limit <= 0:
+            delete_status_safe(chat_id, status_msg)
+            _send_no_scans_prompt(chat_id, user_id=user_id)
+            return
+
+    try:
+        if not status_msg:
+            status_msg = send_status_safe(message, "⚡ Сканю пропорции лица...")
+        processed_bytes = download_and_process_photo(message)
+    except ValueError as val_err:
+        delete_status_safe(chat_id, status_msg)
+        bot.send_message(chat_id, f"⚠️ {val_err}")
+        return
+    except Exception as e:
+        delete_status_safe(chat_id, status_msg)
+        log_error(f"Ошибка скачивания фото: {e}")
+        bot.send_message(chat_id, "⏳ Не удалось скачать фото. Попробуй ещё раз.")
+        return
+
+    photo_hash = hashlib.sha256(CACHE_VERSION.encode("utf-8") + processed_bytes).hexdigest()[:32]
+    cached = cache_get(photo_hash)
+    if cached:
+        scores_text, full_text, card_bytes, card_file_id, _ = cached
+        delete_status_safe(chat_id, status_msg)
+        _send_report_card_or_text(
+            chat_id, card_bytes, scores_text, full_text, photo_hash,
+            is_profile=False, card_file_id=card_file_id,
+        )
+        return
+
+    consumed_mode = None
+    if not admin_user:
+        if pro_tier > 0:
+            if try_consume_pro_scan(user_id, daily_limit):
+                consumed_mode = "pro"
+            elif try_consume_extra_scan(user_id):
+                consumed_mode = "extra"
+            else:
+                delete_status_safe(chat_id, status_msg)
+                _send_pro_daily_limit_prompt(chat_id, daily_limit)
+                return
+        else:
+            if not try_consume_scan(user_id):
+                delete_status_safe(chat_id, status_msg)
+                _send_no_scans_prompt(chat_id, user_id=user_id)
+                return
+            consumed_mode = "free"
+
+    def refund_if_needed():
+        if consumed_mode in ("free", "extra"):
+            refund_scan(user_id)
+        elif consumed_mode == "pro":
+            refund_pro_scan(user_id)
+
+    scan_completed = False
+    try:
+        geom = analyze_face_geometry(processed_bytes)
+        prompt = build_adult_prompt(geom)
+        raw_response, api_errors = run_gemini_pipeline(processed_bytes, prompt)
+
+        if not raw_response:
+            refund_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, format_api_failure(api_errors), parse_mode="HTML")
+            return
+
+        scores_part, full_text = split_model_response(raw_response)
+        verdict = extract_verdict(scores_part)
+        if geom is None:
+            geom = extract_visual_geometry(scores_part)
+        scores_text, params_dict, final_score, category = normalize_adult_scores(scores_part)
+
+        if not scores_text:
+            refund_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, "🤔 Не удалось распознать лицо. Пришли чёткое фото анфас при хорошем свете.")
+            return
+
+        full_combined = _format_full_breakdown(full_text, geom=geom)
+        card_bytes = None
+        try:
+            card_bytes = render_front_report_card(
+                processed_bytes, params_dict or {}, final_score, category, verdict, geom,
+                bot_username=get_bot_username(),
+            )
+        except Exception as card_err:
+            log_error(f"Ошибка рендера карточки: {card_err}")
+
+        if consumed_mode == "free":
+            rem_limit, _, _, _ = get_user_access(user_id)
+            limit_info = (
+                "\n<i>Сканы закончились — пригласи друга (/ref) или пополни баланс (/buy).</i>"
+                if rem_limit == 0
+                else f"\n<i>Осталось сканов: {rem_limit}</i>"
+            )
+        elif consumed_mode == "extra":
+            rem_limit, _, _, _ = get_user_access(user_id)
+            limit_info = f"\n<i>Списан доп. скан из пакета (осталось доп.: {rem_limit})</i>"
+        elif consumed_mode == "pro":
+            pro_left = get_pro_remaining_today(user_id, pro_tier)
+            limit_info = f"\n<i>PRO-сканов на сегодня: {pro_left}/{daily_limit}</i>"
+        else:
+            limit_info = ""
+
+        delta_val = preview_score_delta(user_id, final_score)
+        delta_line = format_score_delta(delta_val)
+
+        delete_status_safe(chat_id, status_msg)
+        sent_file_id = _send_report_card_or_text(
+            chat_id, card_bytes, scores_text, full_combined, photo_hash,
+            verdict=verdict, limit_info=limit_info, delta_line=delta_line, is_profile=False,
+        )
+        scan_completed = True
+        cache_put(photo_hash, scores_text, full_combined, card_image=card_bytes, card_file_id=sent_file_id)
+        record_user_scan_stats(user_id, score=final_score)
+
+    except Exception as e:
+        log_error(f"Ошибка в process_adult_photo: {e}")
+        if not scan_completed:
+            refund_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, "⏳ Произошёл технический сбой. Попробуй ещё раз.")
+    finally:
+        gc.collect()
+
+
+def process_profile_photo(message, status_msg=None):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    def _keep_profile_markup():
+        set_awaiting_profile(user_id)
+        m = InlineKeyboardMarkup()
+        m.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_profile"))
+        return m
+
+    free_limit, pro_tier, _, _ = get_user_access(user_id)
+    admin_user = is_admin(user_id)
+    daily_limit = get_pro_daily_limit_for_tier(pro_tier)
+
+    if not admin_user:
+        if pro_tier <= 0:
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, "👑 Анализ бокового профиля доступен только с активным PRO (/buy).")
+            return
+        if get_pro_remaining_today(user_id, pro_tier) <= 0 and free_limit <= 0:
+            delete_status_safe(chat_id, status_msg)
+            _send_pro_daily_limit_prompt(chat_id, daily_limit)
+            return
+
+    try:
+        if not status_msg:
+            status_msg = send_status_safe(message, "📐 Анализирую структуру бокового профиля...")
+        processed_bytes = download_and_process_photo(message)
+    except ValueError as val_err:
+        delete_status_safe(chat_id, status_msg)
+        bot.send_message(
+            chat_id,
+            f"⚠️ {val_err}\nРежим профиля активен — отправь другое фото сбоку или нажми «Отмена».",
+            reply_markup=_keep_profile_markup(),
+        )
+        return
+    except Exception as e:
+        delete_status_safe(chat_id, status_msg)
+        log_error(f"Ошибка скачивания фото профиля: {e}")
+        bot.send_message(chat_id, "⏳ Не удалось скачать фото. Попробуй ещё раз.", reply_markup=_keep_profile_markup())
+        return
+
+    photo_hash = "p" + hashlib.sha256(PROFILE_CACHE_VERSION.encode("utf-8") + processed_bytes).hexdigest()[:31]
+    cached = cache_get(photo_hash)
+    if cached:
+        scores_text, full_text, card_bytes, card_file_id, _ = cached
+        delete_status_safe(chat_id, status_msg)
+        _send_report_card_or_text(
+            chat_id, card_bytes, scores_text, full_text, photo_hash,
+            is_profile=True, card_file_id=card_file_id,
+        )
+        return
+
+    consumed_mode = None
+    if not admin_user:
+        if try_consume_pro_scan(user_id, daily_limit):
+            consumed_mode = "pro"
+        elif try_consume_extra_scan(user_id):
+            consumed_mode = "extra"
+        else:
+            delete_status_safe(chat_id, status_msg)
+            _send_pro_daily_limit_prompt(chat_id, daily_limit)
+            return
+
+    def refund_profile_if_needed():
+        if consumed_mode == "pro":
+            refund_pro_scan(user_id)
+        elif consumed_mode == "extra":
+            refund_scan(user_id)
+
+    scan_completed = False
+    try:
+        raw_response, api_errors = run_gemini_pipeline(processed_bytes, PROFILE_RATING_PROMPT)
+        if not raw_response:
+            refund_profile_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, format_api_failure(api_errors), parse_mode="HTML", reply_markup=_keep_profile_markup())
+            return
+
+        profile_data, full_text = parse_profile_response(raw_response)
+        if not profile_data:
+            refund_profile_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(
+                chat_id,
+                "🤔 Не удалось распознать боковой профиль. Пришли чёткое фото строго сбоку (90°), чтобы была видна линия челюсти.\n\n"
+                "<i>Режим профиля остаётся активным — отправь следующее фото или нажми «Отмена».</i>",
+                parse_mode="HTML",
+                reply_markup=_keep_profile_markup(),
+            )
+            return
+
+        card_bytes = None
+        try:
+            card_bytes = render_profile_report_card(processed_bytes, profile_data, bot_username=get_bot_username())
+        except Exception as card_err:
+            log_error(f"Ошибка рендера карточки профиля: {card_err}")
+
+        if consumed_mode == "pro":
+            limit_info = f"\n<i>PRO-сканов на сегодня: {get_pro_remaining_today(user_id, pro_tier)}/{daily_limit}</i>"
+        elif consumed_mode == "extra":
+            rem_limit, _, _, _ = get_user_access(user_id)
+            limit_info = f"\n<i>Списан доп. скан из пакета (осталось доп.: {rem_limit})</i>"
+        else:
+            limit_info = ""
+
+        delete_status_safe(chat_id, status_msg)
+        sent_file_id = _send_report_card_or_text(
+            chat_id, card_bytes, profile_data["summary_text"], full_text, photo_hash,
+            verdict=profile_data.get("verdict", ""), limit_info=limit_info, is_profile=True,
+        )
+        scan_completed = True
+        cache_put(photo_hash, profile_data["summary_text"], full_text, card_image=card_bytes, card_file_id=sent_file_id)
+        record_user_scan_stats(user_id, score=None)
+
+    except Exception as e:
+        log_error(f"Ошибка в process_profile_photo: {e}")
+        if not scan_completed:
+            refund_profile_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, "⏳ Произошёл технический сбой. Попробуй ещё раз.")
+    finally:
+        gc.collect()
+
+
+def scan_worker_loop():
+    while True:
+        _, _, scan_type, message, status_msg = _scan_queue.get()
+        user_id = message.from_user.id
+        try:
+            if scan_type == "profile":
+                process_profile_photo(message, status_msg=status_msg)
+            else:
+                process_adult_photo(message, status_msg=status_msg)
+        except Exception as e:
+            log_error(f"Ошибка в scan_worker_loop: {e}")
+        finally:
+            release_user(user_id)
+            _scan_queue.task_done()
+
+
+def start_scan_workers():
+    for i in range(SCAN_WORKERS):
+        threading.Thread(target=scan_worker_loop, name=f"scan-worker-{i + 1}", daemon=True).start()
+
+
+def handle_receipt_submission(message, plan_id):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    plan = PLANS.get(plan_id)
+    if not plan:
+        bot.send_message(chat_id, "⚠️ Тариф не найден. Открой /buy заново.")
+        return
+
+    ok, err_msg = check_plan_allowed(user_id, plan)
+    if not ok:
+        bot.send_message(chat_id, f"⚠️ {err_msg}")
+        return
+
+    existing_req = get_pending_payment_request_id(user_id)
+    if existing_req:
+        bot.reply_to(
+            message,
+            f"⏳ У тебя уже есть нерассмотренная заявка <b>#{existing_req}</b>.\n"
+            "Дождись проверки администратором или напиши в /paysupport.",
+            parse_mode="HTML",
+        )
+        return
+
+    pricing = get_plan_pricing(plan_id, user_id=user_id)
+    req_id = create_payment_request(
+        user_id,
+        plan_id,
+        promo_code=pricing["promo_code"],
+        rub_amount=pricing["rub"],
+    )
+    username = f"@{message.from_user.username}" if message.from_user.username else "без юзернейма"
+    full_name = html.escape(message.from_user.first_name or "Пользователь")
+    promo_note = (
+        f"\nПромокод: <code>{html.escape(pricing['promo_code'])}</code> (-{pricing['discount_pct']}%)"
+        if pricing["promo_code"]
+        else ""
+    )
+
+    caption = (
+        f"💳 <b>Чек по заявке #{req_id}</b>\n\n"
+        f"Юзер: {full_name} ({html.escape(username)})\n"
+        f"ID: <code>{user_id}</code>\n"
+        f"Тариф: <b>{html.escape(plan['title'])}</b> ({pricing['rub']} ₽){promo_note}"
+    )
+
+    admin_markup = InlineKeyboardMarkup()
+    admin_markup.add(
+        InlineKeyboardButton("✅ Выдать доступ", callback_data=f"payok_{req_id}"),
+        InlineKeyboardButton("❌ Отклонить", callback_data=f"payno_{req_id}"),
+    )
+
+    sent_any = False
+    for admin_id in ADMIN_IDS:
+        try:
+            if message.photo:
+                bot.send_photo(admin_id, message.photo[-1].file_id, caption=caption, parse_mode="HTML", reply_markup=admin_markup)
+            elif message.document:
+                bot.send_document(admin_id, message.document.file_id, caption=caption, parse_mode="HTML", reply_markup=admin_markup)
+            sent_any = True
+        except Exception as e:
+            log_error(f"Не удалось отправить чек админу {admin_id}: {e}")
+
+    if sent_any:
+        bot.reply_to(
+            message,
+            f"✅ <b>Чек по заявке #{req_id} отправлен на проверку!</b>\n"
+            f"Тариф: <b>{html.escape(plan['title'])}</b>\n"
+            "После подтверждения доступ активируется автоматически.",
+            parse_mode="HTML",
+        )
+    else:
+        bot.reply_to(message, "⚠️ Не удалось отправить чек администратору. Нажми /paysupport.")
+
+
+@bot.message_handler(content_types=["photo", "document"])
+def handle_photo(message):
+    user_id = message.from_user.id
+    touch_user(message.from_user)
+    if is_user_banned(user_id):
+        bot.send_message(message.chat.id, "⛔ Доступ к боту ограничен.")
+        return
+
+    if is_admin(user_id) and _prepare_broadcast_preview(message):
+        return
+
+    if _is_duplicate_media_group(user_id, getattr(message, "media_group_id", None)):
+        return
+
+    if not check_rate_limit(user_id, "media", min_interval=2.5, max_per_min=10):
+        bot.reply_to(message, "⏳ Слишком частые запросы. Подожди пару секунд.")
+        return
+
+    pending_plan_id, receipt_expired = pop_awaiting_receipt(user_id)
+    if receipt_expired:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("💎 Открыть тарифы", callback_data="buy_menu"))
+        bot.send_message(
+            message.chat.id,
+            "⏳ <b>Время ожидания чека истекло (30 мин).</b>\n"
+            "Чтобы отправить чек, выбери тариф заново через меню ниже — фото не отправлено на скан.",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return
+
+    if pending_plan_id:
+        if message.content_type == "document" and not is_receipt_document(message):
+            set_awaiting_receipt(user_id, pending_plan_id)
+            bot.send_message(message.chat.id, "⚠️ Пришли скриншот чека (фото или PDF-файл).")
+            return
+        handle_receipt_submission(message, pending_plan_id)
+        return
+
+    is_profile_mode, profile_expired = pop_awaiting_profile(user_id)
+    if profile_expired:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("📐 Включить режим профиля", callback_data="profile_scan"))
+        bot.send_message(
+            message.chat.id,
+            "⏳ <b>Режим анализа бокового профиля истёк (30 мин).</b>\n"
+            "Нажми кнопку ниже и отправь фото заново, чтобы оно не пошло как скан анфас.",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return
+
+    if message.content_type == "document" and not is_image_document(message):
+        if is_profile_mode:
+            set_awaiting_profile(user_id)
+        bot.send_message(message.chat.id, "Пришли фото или изображение (JPG/PNG/WEBP).")
+        return
+
+    if not acquire_user(user_id):
+        if is_profile_mode:
+            set_awaiting_profile(user_id)
+        bot.send_message(message.chat.id, "⏳ Предыдущее фото ещё обрабатывается — подожди пару секунд.")
+        return
+
+    try:
+        _, pro_tier, _, is_adult = get_user_access(user_id)
+        if not is_adult and not is_admin(user_id):
+            release_user(user_id)
+            if is_profile_mode:
+                set_awaiting_profile(user_id)
+            send_adult_confirm(message.chat.id)
+            return
+
+        if not is_admin(user_id) and pro_tier <= 0 and _scan_queue.qsize() >= MAX_SCAN_QUEUE_SIZE:
+            release_user(user_id)
+            if is_profile_mode:
+                set_awaiting_profile(user_id)
+            bot.send_message(message.chat.id, "⏳ Очередь переполнена. Попробуй отправить фото через минуту.")
+            return
+
+        scan_type = "profile" if is_profile_mode else "front"
+        front_label = "Сканю пропорции по 468 точкам" if is_mediapipe_available() else "Сканю пропорции лица"
+
+        if is_admin(user_id) or pro_tier >= 2:
+            priority = 0
+            status_text = "📐 Анализирую боковой профиль (топ-приоритет)..." if is_profile_mode else f"⚡ {front_label} (топ-приоритет)..."
+        elif pro_tier == 1:
+            priority = 1
+            status_text = "📐 Анализирую боковой профиль (PRO-приоритет)..." if is_profile_mode else f"⚡ {front_label} (PRO-приоритет)..."
+        else:
+            priority = 2
+            status_text = "⏳ Фото добавлено в очередь..." if _scan_queue.qsize() >= SCAN_WORKERS else f"⚡ {front_label}..."
+
+        status_msg = send_status_safe(message, status_text)
+        _scan_queue.put((priority, next(_scan_seq), scan_type, message, status_msg))
+    except Exception as e:
+        release_user(user_id)
+        if is_profile_mode:
+            set_awaiting_profile(user_id)
+        log_error(f"Ошибка постановки фото в очередь: {e}")
+        bot.send_message(message.chat.id, "⏳ Произошла ошибка при обработке фото. Попробуй ещё раз.")
+
+
+def check_plan_allowed(user_id, plan):
+    if plan["type"] in ("pro30", "pro_life"):
+        _, pro_tier, _, _ = get_user_access(user_id)
+        if pro_tier >= 2:
+            return False, "У тебя уже активен PRO Навсегда!"
+    return True, None
+
+
+@bot.pre_checkout_query_handler(func=lambda query: True)
+def handle_pre_checkout(pre_checkout_query):
+    user_id = pre_checkout_query.from_user.id
+    if is_user_banned(user_id):
+        bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Доступ ограничен.")
+        return
+
+    payload = pre_checkout_query.invoice_payload or ""
+    parts = payload.split(":")
+    if len(parts) in (3, 4) and parts[0] == "plan" and parts[1] in PLANS and parts[2] == str(user_id):
+        plan_id = parts[1]
+        plan = PLANS[plan_id]
+        promo_code = parts[3].strip().upper() if len(parts) == 4 else ""
+
+        if promo_code:
+            pct = validate_discount_promo_for_user(user_id, promo_code)
+            if pct <= 0:
+                bot.answer_pre_checkout_query(
+                    pre_checkout_query.id,
+                    ok=False,
+                    error_message="Промокод истёк, исчерпан или уже привязан к заявке. Открой /buy заново.",
+                )
+                return
+            expected_stars = calc_discounted_price(plan["stars"], pct)
+        else:
+            expected_stars = plan["stars"]
+
+        if pre_checkout_query.currency != "XTR" or pre_checkout_query.total_amount != expected_stars:
+            bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Сумма платежа не совпадает.")
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message=err_msg or "Тариф недоступен.")
+            return
+        bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+    else:
+        bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Тариф не найден.")
+
+
+@bot.message_handler(content_types=["successful_payment"])
+def handle_successful_payment(message):
+    sp = message.successful_payment
+    user_id = message.from_user.id
+    parts = (sp.invoice_payload or "").split(":")
+    if len(parts) not in (3, 4) or parts[0] != "plan" or parts[1] not in PLANS or parts[2] != str(user_id):
+        log_error(f"Некорректный successful_payment payload от {user_id}: {sp.invoice_payload}")
+        return
+
+    plan_id = parts[1]
+    plan = PLANS[plan_id]
+    promo_code = parts[3].strip().upper() if len(parts) == 4 else ""
+
+    if promo_code:
+        pct = get_promo_discount_value_raw(promo_code)
+        expected_stars = calc_discounted_price(plan["stars"], pct) if pct > 0 else -1
+    else:
+        expected_stars = plan["stars"]
+
+    if sp.currency != "XTR" or sp.total_amount != expected_stars:
+        log_error(
+            f"Несовпадение суммы Stars от {user_id}: {sp.total_amount} {sp.currency} != {expected_stars} XTR"
+        )
+        return
+
+    if not record_stars_payment(sp.telegram_payment_charge_id, user_id, plan_id, sp.total_amount):
+        return
+
+    if promo_code:
+        consume_discount_promo(user_id, promo_code)
+
+    apply_plan_to_user(user_id, plan_id)
+    bot.send_message(
+        message.chat.id,
+        f"✅ <b>Оплата прошла успешно!</b>\nАктивировано: <b>{html.escape(plan['title'])}</b>.",
+        parse_mode="HTML",
+    )
+
+    username = f"@{message.from_user.username}" if message.from_user.username else "без юзернейма"
+    promo_str = f" (промокод {html.escape(promo_code)})" if promo_code else ""
+    for admin_id in ADMIN_IDS:
+        try:
+            bot.send_message(
+                admin_id,
+                f"⭐ <b>Оплата Telegram Stars</b>\n"
+                f"Юзер: <code>{user_id}</code> ({html.escape(username)})\n"
+                f"Тариф: {html.escape(plan['title'])} — <b>{sp.total_amount} ⭐</b>{promo_str}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    if not call.message:
+        safe_answer(call.id)
+        return
+
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
+    is_text_msg = call.message.content_type == "text"
+    edit_id = msg_id if is_text_msg else None
+
+    touch_user(call.from_user)
+    if is_user_banned(user_id):
+        safe_answer(call.id, "Доступ ограничен.", show_alert=True)
+        return
+
+    if not check_rate_limit(user_id, "cb", min_interval=0.4, max_per_min=35):
+        safe_answer(call.id, "Не так быстро 🙂")
+        return
+
+    data = call.data or ""
+
+    if data == "confirm_18":
+        set_user_adult(user_id)
+        safe_answer(call.id, "Возраст подтверждён")
+        try:
+            bot.edit_message_text("✅ Доступ открыт. Отправь фото лица анфас для анализа.", chat_id, msg_id)
+        except Exception:
+            bot.send_message(chat_id, "✅ Доступ открыт. Отправь фото лица анфас для анализа.")
+
+    elif data == "main_menu":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_main_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "main_menu_new":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_main_menu_view(user_id)
+        bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+
+    elif data == "psl_scale":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_psl_scale_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "psl_scale_new":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_psl_scale_view()
+        bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+
+    elif data == "scan_front_tip":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text = (
+            "<b>📸 Анализ лица анфас</b>\n\n"
+            "<blockquote>• Смотри прямо в камеру без наклона головы\n"
+            "• Ровный фронтальный свет, без жёстких теней\n"
+            "• Нейтральное выражение лица, без фильтров и очков</blockquote>\n\n"
+            "Просто отправь фото прямо сюда в чат."
+        )
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("📖 Шкала PSL", callback_data="psl_scale"))
+        markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "my_profile":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_profile_cabinet_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "buy_menu":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_buy_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "enter_promo":
+        clear_pending_modes(user_id)
+        set_awaiting_promo(user_id)
+        safe_answer(call.id, "Введи промокод")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_promo"))
+        edit_or_send(
+            chat_id,
+            "🎁 <b>Активация промокода</b>\n\n"
+            "Отправь промокод следующим сообщением в чат (например: <code>ADONIS</code>).",
+            reply_markup=markup,
+            message_id=edit_id,
+        )
+
+    elif data == "cancel_promo":
+        clear_awaiting_promo(user_id)
+        safe_answer(call.id, "Отменено")
+        text, markup = build_main_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "channel_bonus":
+        clear_pending_modes(user_id)
+        if not is_channel_bonus_enabled():
+            safe_answer(call.id, "Бонус пока недоступен.", show_alert=True)
+            return
+        if is_channel_bonus_claimed(user_id):
+            safe_answer(call.id, "Ты уже получил бонус за подписку!", show_alert=True)
+            return
+        safe_answer(call.id)
+        text, markup = build_channel_bonus_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "check_sub":
+        if not is_channel_bonus_enabled():
+            safe_answer(call.id, "Канал не настроен.", show_alert=True)
+            return
+        if is_channel_bonus_claimed(user_id):
+            safe_answer(call.id, "Бонус уже получен!", show_alert=True)
+            return
+        try:
+            member = bot.get_chat_member(get_channel_chat_id(), user_id)
+            is_sub = getattr(member, "status", "") in ("member", "administrator", "creator")
+        except Exception as e:
+            log_error(f"Ошибка проверки подписки на {CHANNEL_ID}: {e}")
+            safe_answer(call.id, "Не удалось проверить подписку. Попробуй позже.", show_alert=True)
+            return
+
+        if not is_sub:
+            safe_answer(call.id, "Подписка не найдена. Сначала подпишись на канал!", show_alert=True)
+            return
+
+        if claim_channel_bonus(user_id):
+            safe_answer(call.id, f"+{CHANNEL_SUB_BONUS} скан начислен!", show_alert=True)
+            text, markup = build_main_menu_view(user_id)
+            edit_or_send(
+                chat_id,
+                f"🎉 <b>Спасибо за подписку!</b> Начислено <b>+{CHANNEL_SUB_BONUS} бесплатный скан</b>.\n\n{text}",
+                reply_markup=markup,
+                message_id=edit_id,
+            )
+        else:
+            safe_answer(call.id, "Бонус уже был выдан ранее.", show_alert=True)
+
+    elif data == "get_ref":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_ref_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "support_menu":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_support_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "profile_scan":
+        clear_pending_modes(user_id)
+        _, pro_tier, _, _ = get_user_access(user_id)
+        if pro_tier <= 0 and not is_admin(user_id):
+            safe_answer(call.id, "Доступно в PRO")
+            markup = InlineKeyboardMarkup(row_width=1)
+            markup.add(InlineKeyboardButton("👑 Подключить PRO", callback_data="buy_menu"))
+            markup.add(InlineKeyboardButton("🤝 Получить PRO за друзей", callback_data="get_ref"))
+            markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+            text = (
+                "<b>📐 Анализ бокового профиля (PRO)</b>\n\n"
+                "<blockquote>Структурная карточка по 6 ключевым параметрам:\n"
+                "• Проекция подбородка и максиллы\n"
+                "• Чёткость угла челюсти\n"
+                "• Шейно-подбородочный угол\n"
+                "• Профиль носа и общая гармония</blockquote>\n\n"
+                "Открывается на тарифах <b>PRO 30 дней</b> и <b>PRO Навсегда</b>."
+            )
+            edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+            return
+
+        set_awaiting_profile(user_id)
+        safe_answer(call.id, "Отправь фото в профиль")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_profile"))
+        text = (
+            "<b>📐 Режим анализа бокового профиля</b>\n\n"
+            "<blockquote>Отправь чёткое фото строго <b>сбоку (90°)</b> при хорошем свете, "
+            "чтобы была видна линия челюсти, подбородок и профиль носа.</blockquote>"
+        )
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "cancel_profile":
+        clear_awaiting_profile(user_id)
+        safe_answer(call.id, "Режим профиля отменён")
+        text, markup = build_main_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "cancel_pay":
+        clear_pending_modes(user_id)
+        safe_answer(call.id, "Оплата отменена")
+        text, markup = build_main_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data.startswith("plan_"):
+        clear_pending_modes(user_id)
+        plan_id = data[5:]
+        plan = PLANS.get(plan_id)
+        if not plan:
+            safe_answer(call.id, "Тариф не найден.", show_alert=True)
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            safe_answer(call.id, err_msg, show_alert=True)
+            return
+
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        safe_answer(call.id)
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton(f"⭐ Оплатить {pr['stars']} Stars (мгновенно)", callback_data=f"stars_{plan_id}"))
+        if PAYMENT_CARD:
+            markup.add(InlineKeyboardButton(f"💳 Перевод на карту (только РФ) — {pr['rub']} ₽", callback_data=f"card_{plan_id}"))
+        markup.add(InlineKeyboardButton("⬅️ К тарифам", callback_data="buy_menu"))
+
+        promo_info = (
+            f"\n🎁 Промокод <code>{html.escape(pr['promo_code'])}</code>: скидка <b>-{pr['discount_pct']}%</b> "
+            f"(<s>{pr['orig_stars']} ⭐</s> → <b>{pr['stars']} ⭐</b> | <s>{pr['orig_rub']} ₽</s> → <b>{pr['rub']} ₽</b>)"
+            if pr["promo_code"]
+            else ""
+        )
+        text = (
+            f"<b>{html.escape(plan['title'])}</b>\n\n"
+            f"<blockquote>{html.escape(plan['desc'])}{promo_info}</blockquote>\n\n"
+            "Выбери удобный способ оплаты:"
+        )
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data.startswith("stars_"):
+        clear_pending_modes(user_id)
+        plan_id = data[6:]
+        plan = PLANS.get(plan_id)
+        if not plan:
+            safe_answer(call.id, "Тариф не найден.", show_alert=True)
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            safe_answer(call.id, err_msg, show_alert=True)
+            return
+
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        inv_payload = (
+            f"plan:{plan_id}:{user_id}:{pr['promo_code']}"
+            if pr["promo_code"]
+            else f"plan:{plan_id}:{user_id}"
+        )
+        desc = (
+            f"{plan['desc']} (промокод {pr['promo_code']} -{pr['discount_pct']}%)"
+            if pr["promo_code"]
+            else plan["desc"]
+        )
+        safe_answer(call.id, "Открываю счёт...")
+        try:
+            bot.send_invoice(
+                chat_id=chat_id,
+                title=plan["title"],
+                description=desc,
+                invoice_payload=inv_payload,
+                provider_token="",
+                currency="XTR",
+                prices=[LabeledPrice(label=plan["title"], amount=pr["stars"])],
+            )
+        except Exception as e:
+            log_error(f"Ошибка выставления счёта Stars: {e}")
+            bot.send_message(chat_id, "⚠️ Не удалось создать счёт Stars. Попробуй позже или выбери карту.")
+
+    elif data.startswith("card_"):
+        clear_pending_modes(user_id)
+        plan_id = data[5:]
+        plan = PLANS.get(plan_id)
+        if not plan or not PAYMENT_CARD:
+            safe_answer(call.id, "Оплата картой временно недоступна.", show_alert=True)
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            safe_answer(call.id, err_msg, show_alert=True)
+            return
+
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        safe_answer(call.id)
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("✅ Я оплатил — отправить чек", callback_data=f"paid_{plan_id}"))
+        markup.add(InlineKeyboardButton("⬅️ К тарифам", callback_data="buy_menu"))
+
+        sum_str = (
+            f"<s>{pr['orig_rub']} ₽</s> <b>{pr['rub']} ₽</b> (промокод {html.escape(pr['promo_code'])} -{pr['discount_pct']}%)"
+            if pr["promo_code"]
+            else f"<b>{pr['rub']} ₽</b>"
+        )
+        text = (
+            f"<b>💳 Оплата картой (только РФ): {html.escape(plan['title'])}</b>\n\n"
+            f"<blockquote>Сумма: {sum_str}\n"
+            f"Банк: <b>{html.escape(PAYMENT_BANK)}</b>\n"
+            f"Карта: <code>{html.escape(PAYMENT_CARD)}</code></blockquote>\n\n"
+            "После перевода нажми кнопку ниже и отправь чек."
+        )
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data.startswith("paid_"):
+        plan_id = data[5:]
+        plan = PLANS.get(plan_id)
+        if not plan or not PAYMENT_CARD:
+            safe_answer(call.id, "Оплата картой временно недоступна.", show_alert=True)
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            safe_answer(call.id, err_msg, show_alert=True)
+            return
+        existing_req = get_pending_payment_request_id(user_id)
+        if existing_req:
+            safe_answer(call.id, f"Заявка #{existing_req} ещё на проверке.", show_alert=True)
+            return
+
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        set_awaiting_receipt(user_id, plan_id)
+        safe_answer(call.id, "Отправь скриншот или PDF-чек")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_pay"))
+        text = (
+            f"📸 <b>Отправь скриншот или PDF-чек</b> об оплате "
+            f"<b>{html.escape(plan['title'])}</b> ({pr['rub']} ₽) прямо сюда в чат."
+        )
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data.startswith("payok_") or data.startswith("payno_"):
+        if not is_admin(user_id):
+            safe_answer(call.id, "Нет прав.", show_alert=True)
+            return
+        is_approve = data.startswith("payok_")
+        try:
+            req_id = int(data.split("_", 1)[1])
+        except ValueError:
+            safe_answer(call.id, "Некорректная заявка.", show_alert=True)
+            return
+
+        resolved = resolve_payment_request(req_id, "approved" if is_approve else "rejected")
+        if not resolved:
+            safe_answer(call.id, "Заявка уже обработана.", show_alert=True)
+            return
+
+        target_id, plan_id, req_promo, _ = resolved
+        plan = PLANS.get(plan_id)
+
+        if is_approve and plan:
+            if req_promo:
+                consume_discount_promo(target_id, req_promo)
+            apply_plan_to_user(target_id, plan_id)
+            safe_answer(call.id, "Доступ выдан!")
+            status_suffix = "\n\n✅ <b>Доступ выдан</b>"
+            try:
+                bot.send_message(
+                    target_id,
+                    f"✅ <b>Оплата подтверждена!</b>\nАктивировано: <b>{html.escape(plan['title'])}</b>.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        else:
+            safe_answer(call.id, "Заявка отклонена.")
+            status_suffix = "\n\n❌ <b>Отклонено</b>"
+            try:
+                bot.send_message(target_id, f"❌ Заявка на оплату #{req_id} отклонена администратором.")
+            except Exception:
+                pass
+
+        try:
+            if call.message.content_type in ("photo", "document"):
+                base_cap = call.message.html_caption or html.escape(call.message.caption or "")
+                bot.edit_message_caption(base_cap + status_suffix, chat_id, msg_id, parse_mode="HTML", reply_markup=None)
+            else:
+                base_txt = call.message.html_text or html.escape(call.message.text or "")
+                bot.edit_message_text(base_txt + status_suffix, chat_id, msg_id, parse_mode="HTML", reply_markup=None)
+        except Exception:
+            try:
+                bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
+            except Exception:
+                pass
+
+    elif data.startswith("setmodel_"):
+        if not is_admin(user_id):
+            safe_answer(call.id, "Нет прав.", show_alert=True)
+            return
+        clear_awaiting_model(user_id)
+        chosen = data[9:].strip()
+        parsed = parse_models_input(chosen)
+        if not parsed:
+            safe_answer(call.id, "Некорректная модель.", show_alert=True)
+            return
+        set_active_models(parsed)
+        safe_answer(call.id, f"Установлена {parsed[0]}")
+        text, markup = build_model_manager_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "model_custom":
+        if not is_admin(user_id):
+            safe_answer(call.id, "Нет прав.", show_alert=True)
+            return
+        clear_pending_modes(user_id)
+        set_awaiting_model(user_id)
+        safe_answer(call.id, "Отправь название модели")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="model_cancel"))
+        edit_or_send(
+            chat_id,
+            "✏️ <b>Ввод своей модели Gemini</b>\n\n"
+            "Отправь следующим сообщением точное название модели (например: "
+            "<code>gemini-3.5-flash-lite</code>) или несколько через запятую.",
+            reply_markup=markup,
+            message_id=edit_id,
+        )
+
+    elif data == "model_cancel":
+        if not is_admin(user_id):
+            safe_answer(call.id)
+            return
+        clear_awaiting_model(user_id)
+        safe_answer(call.id, "Отменено")
+        text, markup = build_model_manager_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "model_reset_cd":
+        if not is_admin(user_id):
+            safe_answer(call.id, "Нет прав.", show_alert=True)
+            return
+        reset_model_cooldowns()
+        safe_answer(call.id, "Паузы 404/429 сброшены!", show_alert=True)
+
+    elif data == "bc_cancel":
+        if not is_admin(user_id):
+            safe_answer(call.id)
+            return
+        clear_broadcast_state(user_id)
+        safe_answer(call.id, "Рассылка отменена")
+        try:
+            bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
+        except Exception:
+            pass
+        bot.send_message(chat_id, "❌ Рассылка отменена.")
+
+    elif data == "bc_send":
+        if not is_admin(user_id):
+            safe_answer(call.id)
+            return
+        with _broadcast_lock:
+            payload = _broadcast_state.pop(user_id, None)
+        if not payload or payload.get("step") != "ready":
+            safe_answer(call.id, "Нет активного черновика.", show_alert=True)
+            return
+        safe_answer(call.id, "Запускаю рассылку...")
+        try:
+            bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
+        except Exception:
+            pass
+        bot.send_message(chat_id, "🚀 Рассылка запущена в фоне...")
+        threading.Thread(target=_run_broadcast_worker, args=(chat_id, payload), daemon=True).start()
+
+    elif data.startswith("full_"):
+        photo_hash = data[5:]
+        if not re.fullmatch(r"p?[0-9a-f]{31,32}", photo_hash):
+            safe_answer(call.id, "Некорректный идентификатор отчёта.", show_alert=True)
+            return
+        cached = cache_get(photo_hash)
+        if cached and cached[1]:
+            safe_answer(call.id, "Загружаю разбор...")
+            title = "📐 Разбор бокового профиля" if photo_hash.startswith("p") else "💬 Подробный разбор"
+            send_long_html(chat_id, title, cached[1])
+        else:
+            safe_answer(call.id, "Разбор устарел, отправь фото заново.", show_alert=True)
+
+    elif data.startswith("growth_"):
+        photo_hash = data[7:]
+        if not re.fullmatch(r"[0-9a-f]{32}", photo_hash):
+            safe_answer(call.id, "Некорректный идентификатор отчёта.", show_alert=True)
+            return
+
+        _, pro_tier, _, _ = get_user_access(user_id)
+        if pro_tier <= 0 and not is_admin(user_id):
+            safe_answer(call.id, "Доступно в PRO")
+            markup = InlineKeyboardMarkup(row_width=1)
+            markup.add(InlineKeyboardButton("👑 Подключить PRO", callback_data="buy_menu"))
+            markup.add(InlineKeyboardButton("🤝 Получить PRO за друзей", callback_data="get_ref"))
+            bot.send_message(
+                chat_id,
+                "<b>📈 Персональный план роста (PRO)</b>\n\n"
+                "<blockquote>По результатам твоего скана бот составит пошаговый план:\n"
+                "• Топ-3 зоны роста с максимальным эффектом\n"
+                "• Подбор стрижки и щетины строго под твою форму лица\n"
+                "• Чек-лист по коже, бровям, отёчности и грумингу на 30 дней</blockquote>\n\n"
+                "Открывается на тарифах <b>PRO</b> или бесплатно за 3 приглашённых друзей.",
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+            return
+
+        cached = cache_get(photo_hash)
+        if not cached:
+            safe_answer(call.id, "Отчёт устарел, отправь фото заново.", show_alert=True)
+            return
+
+        scores_text, full_text, _, _, growth_plan = cached
+        if growth_plan:
+            safe_answer(call.id, "Загружаю план роста...")
+            send_long_html(chat_id, "📈 Персональный план роста (PRO)", growth_plan)
+            return
+
+        busy_key = (user_id, photo_hash)
+        with _growth_busy_lock:
+            if busy_key in _growth_busy:
+                safe_answer(call.id, "План уже составляется, подожди пару секунд...")
+                return
+            _growth_busy.add(busy_key)
+
+        safe_answer(call.id, "Составляю персональный план...")
+        status_msg = bot.send_message(chat_id, "📈 Составляю персональный план роста по твоим метрикам...")
+        threading.Thread(
+            target=_run_growth_plan_worker,
+            args=(chat_id, user_id, photo_hash, scores_text, full_text, status_msg),
+            daemon=True,
+        ).start()
+
+    else:
+        safe_answer(call.id)
+
+
+@bot.message_handler(content_types=["text"])
+def handle_fallback_text(message):
+    user_id = message.from_user.id
+    touch_user(message.from_user)
+    if is_user_banned(user_id):
+        return
+
+    if is_awaiting_promo(user_id):
+        clear_awaiting_promo(user_id)
+        ok, ptype, msg_text = activate_promocode_for_user(user_id, message.text)
+        markup = InlineKeyboardMarkup(row_width=1)
+        if ok and ptype == "discount":
+            markup.add(InlineKeyboardButton("💎 Перейти к тарифам со скидкой", callback_data="buy_menu"))
+        elif not ok:
+            markup.add(InlineKeyboardButton("🔁 Попробовать другой код", callback_data="enter_promo"))
+        markup.add(InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
+        bot.reply_to(message, msg_text, parse_mode="HTML", reply_markup=markup)
+        return
+
+    if is_awaiting_receipt(user_id):
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_pay"))
+        bot.reply_to(
+            message,
+            "📸 Жду <b>скриншот или PDF-чек</b> об оплате. Пришли его фото/файлом или нажми «Отмена».",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+    elif is_awaiting_profile(user_id):
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_profile"))
+        bot.reply_to(
+            message,
+            "📐 Сейчас активен режим <b>бокового профиля</b>. Пришли фото сбоку (90°) или нажми «Отмена».",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+
+
+if __name__ == "__main__":
+    init_db()
+    ensure_user_columns()
+    load_active_models_from_db()
+    setup_bot_commands()
+    start_scan_workers()
+    is_mediapipe_available()
+    uname = get_bot_username()
+    print(f"🚀 Adonis PSL Bot (@{uname or 'unknown'}) запущен!")
+
+    while True:
+        try:
+            bot.infinity_polling(
+                timeout=30,
+                long_polling_timeout=25,
+                skip_pending=True,
+            )
+        except KeyboardInterrupt:
+            print("🛑 Бот остановлен вручную.")
+            break
+        except Exception as e:
+            log_error(f"Сбой polling, перезапуск через 5 сек: {e}")
+            time.sleep(5) _media_group_lock = threading.Lock()
+_seen_media_groups = {}
+
+
+def _is_duplicate_media_group(user_id, media_group_id):
+    if not media_group_id:
+        return False
+    now = time.time()
+    key = (user_id, str(media_group_id))
+    with _media_group_lock:
+        if len(_seen_media_groups) > 500:
+            cutoff = now - 60.0
+            stale = [k for k, ts in _seen_media_groups.items() if ts < cutoff]
+            for k in stale:
+                del _seen_media_groups[k]
+        if key in _seen_media_groups and (now - _seen_media_groups[key]) < 30.0:
+            return True
+        _seen_media_groups[key] = now
+        return False
+
+
+def send_status_safe(message, text):
+    try:
+        return bot.reply_to(message, text)
+    except Exception:
+        try:
+            return bot.send_message(message.chat.id, text)
+        except Exception as e:
+            log_error(f"Не удалось отправить статус: {e}")
+            return None
+
+
+def delete_status_safe(chat_id, status_msg):
+    if not status_msg:
+        return
+    try:
+        bot.delete_message(chat_id, status_msg.message_id)
+    except Exception:
+        pass
+
+
+def safe_answer(call_id, text=None, show_alert=False):
+    try:
+        bot.answer_callback_query(call_id, text, show_alert=show_alert)
+    except Exception as e:
+        log_error(f"answer_callback_query: {e}")
+
+
+def edit_or_send(chat_id, text, reply_markup=None, message_id=None, parse_mode="HTML"):
+    if message_id:
+        try:
+            bot.edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=message_id,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+            return
+        except Exception as e:
+            if "message is not modified" in str(e).lower():
+                return
+    bot.send_message(
+        chat_id,
+        text,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True,
+    )
+
+
+def send_long_html(chat_id, title, text, limit=3500):
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if current and len(current) + len(line) + 1 > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
+
+    for i, chunk in enumerate(chunks):
+        header = f"<b>{html.escape(title)}</b>\n\n" if i == 0 else ""
+        try:
+            bot.send_message(chat_id, header + html.escape(chunk), parse_mode="HTML")
+        except Exception:
+            plain = f"{title}\n\n{chunk}" if i == 0 else chunk
+            bot.send_message(chat_id, plain, parse_mode=None)
+
+
+def is_image_document(message):
+    doc = getattr(message, "document", None)
+    if not doc:
+        return False
+    mime = (doc.mime_type or "").lower()
+    fname = (doc.file_name or "").lower()
+    return mime.startswith("image/") or fname.endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp"))
+
+
+def is_receipt_document(message):
+    if is_image_document(message):
+        return True
+    doc = getattr(message, "document", None)
+    if not doc:
+        return False
+    mime = (doc.mime_type or "").lower()
+    fname = (doc.file_name or "").lower()
+    return mime == "application/pdf" or fname.endswith(".pdf")
+
+
+def download_and_process_photo(message):
+    if message.photo:
+        file_obj = message.photo[-1]
+    elif message.document:
+        file_obj = message.document
+    else:
+        raise ValueError("Пришли фото лица.")
+
+    if (getattr(file_obj, "file_size", 0) or 0) > MAX_IMAGE_FILE_SIZE:
+        raise ValueError("Файл слишком большой (максимум 15 МБ).")
+
+    file_info = bot.get_file(file_obj.file_id)
+    if (file_info.file_size or 0) > MAX_IMAGE_FILE_SIZE:
+        raise ValueError("Файл слишком большой (максимум 15 МБ).")
+
+    raw_bytes = bot.download_file(file_info.file_path)
+    try:
+        with io.BytesIO(raw_bytes) as in_buf, Image.open(in_buf) as img:
+            img = ImageOps.exif_transpose(img)
+            if img.width < 64 or img.height < 64:
+                raise ValueError("Изображение слишком маленькое. Пришли чёткое фото лица.")
+            rgb = img.convert("RGB")
+            rgb.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+            with io.BytesIO() as out_buf:
+                rgb.save(out_buf, format="JPEG", quality=90, optimize=True)
+                return out_buf.getvalue()
+    except ValueError:
+        raise
+    except Image.DecompressionBombError:
+        raise ValueError("Изображение имеет слишком высокое разрешение.")
+    except Exception:
+        raise ValueError("Не удалось прочитать изображение. Пришли обычный JPG или PNG.")
+
+
+def setup_bot_commands():
+    default_commands = [
+        BotCommand("start", "Главное меню"),
+        BotCommand("buy", "Тарифы и сканы"),
+        BotCommand("ref", "Пригласить друга (+1 скан)"),
+        BotCommand("scale", "Шкала PSL 1.0–8.0"),
+        BotCommand("paysupport", "Поддержка"),
+    ]
+    admin_commands = default_commands + [
+        BotCommand("admin", "Шпаргалка по админке"),
+        BotCommand("model", "Сменить модель Gemini"),
+    ]
+    try:
+        bot.set_my_commands(default_commands, scope=BotCommandScopeDefault())
+        for admin_id in ADMIN_IDS:
+            bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
+    except Exception as e:
+        log_error(f"Не удалось выставить меню команд: {e}")
+
+
+def format_user_status_short(user_id):
+    free_limit, pro_tier, pro_until, _ = get_user_access(user_id)
+    if is_admin(user_id):
+        return "👑 <b>Администратор</b> • без лимитов"
+    extra_str = f" (+{free_limit} доп.)" if free_limit > 0 else ""
+    if pro_tier >= 2:
+        left = get_pro_remaining_today(user_id, pro_tier)
+        return f"💎 <b>PRO Навсегда</b> • сегодня {left}/{PRO_LIFE_DAILY_LIMIT}{extra_str}"
+    if pro_tier == 1:
+        left = get_pro_remaining_today(user_id, pro_tier)
+        until_str = format_date_from_ts(pro_until) if pro_until > 0 else "—"
+        return f"👑 <b>PRO до {until_str}</b> • сегодня {left}/{PRO30_DAILY_LIMIT}{extra_str}"
+    return f"⚡ <b>Базовый</b> • доступно сканов: <b>{free_limit}</b>"
+
+
+def format_score_delta(delta):
+    if delta is None:
+        return ""
+    if delta > 0.05:
+        return f"📈 +{delta:.1f} к прошлому скану"
+    if delta < -0.05:
+        return f"📉 {delta:.1f} к прошлому скану"
+    return "➖ без изменений к прошлому скану"
+
+
+def preview_score_delta(user_id, new_score):
+    if new_score is None:
+        return None
+    _, best_score, _, _, _, _, last_score, _ = get_user_profile_stats(user_id)
+    ref_score = last_score if last_score > 0.0 else best_score
+    if ref_score <= 0.0:
+        return None
+    return round(float(new_score) - float(ref_score), 1)
+
+
+def build_main_menu_view(user_id):
+    free_limit, pro_tier, _, _ = get_user_access(user_id)
+    status_line = format_user_status_short(user_id)
+    scans_cnt, best_score, _, _, _, _, last_score, prev_score = get_user_profile_stats(user_id)
+    best_line = f" • Лучший балл: <b>{best_score:.1f}/8</b>" if best_score > 0 else ""
+    delta_line = ""
+    if last_score > 0 and prev_score > 0:
+        d_txt = format_score_delta(round(last_score - prev_score, 1))
+        if d_txt:
+            delta_line = f"\nПоследний скан: <b>{last_score:.1f}/8</b> ({d_txt})"
+
+    sub_hint = ""
+    if (
+        not is_admin(user_id)
+        and pro_tier == 0
+        and free_limit <= 0
+        and is_channel_bonus_enabled()
+        and not is_channel_bonus_claimed(user_id)
+    ):
+        sub_hint = (
+            f"\n\n🎁 <b>Получи +{CHANNEL_SUB_BONUS} бесплатный скан:</b> "
+            "подпишись на наш канал кнопкой ниже!"
+        )
+
+    text = (
+        "<b>ADONIS PSL • Биометрия лица</b>\n\n"
+        f"<blockquote>{status_line}\n"
+        f"Сканов выполнено: <b>{scans_cnt}</b>{best_line}{delta_line}</blockquote>\n\n"
+        "Просто отправь <b>фото анфас</b> при ровном свете — бот замерит пропорции "
+        f"и соберёт карточку-отчёт по шкале 1.0–8.0.{sub_hint}"
+    )
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("📸 Анализ анфас", callback_data="scan_front_tip"),
+        InlineKeyboardButton("📐 Профиль (PRO)", callback_data="profile_scan"),
+    )
+    markup.add(
+        InlineKeyboardButton("👤 Мой профиль", callback_data="my_profile"),
+        InlineKeyboardButton("💎 Тарифы и сканы", callback_data="buy_menu"),
+    )
+    markup.add(
+        InlineKeyboardButton("🤝 Пригласить друга", callback_data="get_ref"),
+        InlineKeyboardButton("📖 Шкала PSL", callback_data="psl_scale"),
+    )
+    if is_channel_bonus_enabled() and not is_channel_bonus_claimed(user_id):
+        markup.add(
+            InlineKeyboardButton(
+                f"📢 +{CHANNEL_SUB_BONUS} скан за подписку",
+                callback_data="channel_bonus",
+            ),
+            InlineKeyboardButton("🆘 Поддержка", callback_data="support_menu"),
+        )
+    else:
+        markup.add(InlineKeyboardButton("🆘 Поддержка", callback_data="support_menu"))
+    return text, markup
+
+
+def build_psl_scale_view():
+    text = (
+        "<b>📖 Шкала PSL (1.0–8.0)</b>\n\n"
+        "<blockquote>"
+        "• <b>1.0–2.4</b> — <b>Саб 3</b> <i>(нижние ~5%)</i>\n"
+        "• <b>2.5–2.9</b> — <b>Саб 5</b> <i>(ниже среднего)</i>\n"
+        "• <b>3.0–3.4</b> — <b>Лтн</b> <i>(нижняя граница нормы)</i>\n"
+        "• <b>3.5–3.9</b> — <b>Мтн</b> <i>(средняя норма, ~50-й процентиль)</i>\n"
+        "• <b>4.0–4.4</b> — <b>Мхтн</b> <i>(выше среднего)</i>\n"
+        "• <b>4.5–4.9</b> — <b>Хмтн</b> <i>(верхние ~20%)</i>\n"
+        "• <b>5.0–5.4</b> — <b>Хтн</b> <i>(верхние ~10%)</i>\n"
+        "• <b>5.5–6.4</b> — <b>Лоу чад лайт</b> <i>(модельный уровень, топ ~3%)</i>\n"
+        "• <b>6.5–6.9</b> — <b>Чад лайт</b> <i>(сильный модельный, топ ~1%)</i>\n"
+        "• <b>7.0–8.0</b> — <b>Чад</b> <i>(элитный мировой уровень, топ &lt;0.2%)</i>"
+        "</blockquote>\n\n"
+        "<b>📸 Как получить точный замер:</b>\n"
+        "• Основная камера на уровне глаз с расстояния ~1–1.5 м (без широкоугольных искажений)\n"
+        "• Ровный фронтальный дневной свет, нейтральное лицо, без фильтров и очков"
+    )
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("📸 Сделать скан", callback_data="scan_front_tip"),
+        InlineKeyboardButton("👤 Мой профиль", callback_data="my_profile"),
+    )
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def build_profile_cabinet_view(user_id):
+    status_line = format_user_status_short(user_id)
+    scans_cnt, best_score, ref_count, _, _, _, last_score, prev_score = get_user_profile_stats(user_id)
+    best_str = f"<b>{best_score:.1f}/8</b> ({category_by_score(best_score)})" if best_score > 0 else "ещё нет"
+
+    last_line = ""
+    if last_score > 0:
+        delta_txt = format_score_delta(round(last_score - prev_score, 1)) if prev_score > 0 else ""
+        delta_part = f" • {delta_txt}" if delta_txt else ""
+        last_line = f"\nПоследний скан: <b>{last_score:.1f}/8</b>{delta_part}"
+
+    promo_code, discount_pct = get_user_active_discount(user_id)
+    promo_line = (
+        f"\nАктивный промокод: <code>{html.escape(promo_code)}</code> (<b>-{discount_pct}%</b>)"
+        if promo_code
+        else ""
+    )
+
+    uname = get_bot_username()
+    ref_block = (
+        f"\n🔗 Реф-ссылка:\n<code>https://t.me/{uname}?start=ref_{user_id}</code>"
+        if uname
+        else ""
+    )
+
+    text = (
+        "<b>👤 Мой профиль</b>\n\n"
+        f"<blockquote>{status_line}\n"
+        f"ID: <code>{user_id}</code>\n"
+        f"Всего сканов: <b>{scans_cnt}</b>\n"
+        f"Лучший результат: {best_str}{last_line}\n"
+        f"Приглашено друзей: <b>{ref_count}</b>{promo_line}</blockquote>"
+        f"{ref_block}"
+    )
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("💎 Пополнить / PRO", callback_data="buy_menu"),
+        InlineKeyboardButton("🎁 Промокод", callback_data="enter_promo"),
+    )
+    markup.add(
+        InlineKeyboardButton("🤝 Рефералка", callback_data="get_ref"),
+        InlineKeyboardButton("📖 Шкала PSL", callback_data="psl_scale"),
+    )
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def build_buy_menu_view(user_id=None):
+    promo_code, discount_pct = get_user_active_discount(user_id) if user_id is not None else ("", 0)
+    promo_banner = (
+        f"🎁 <b>Активна скидка -{discount_pct}%</b> по промокоду <code>{html.escape(promo_code)}</code>!\n\n"
+        if promo_code
+        else ""
+    )
+
+    lines = []
+    for plan_id, plan in PLANS.items():
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        if pr["discount_pct"] > 0:
+            price_txt = (
+                f"<s>{pr['orig_stars']} ⭐</s> <b>{pr['stars']} ⭐</b> / "
+                f"<s>{pr['orig_rub']} ₽</s> <b>{pr['rub']} ₽</b>"
+            )
+        else:
+            price_txt = f"{pr['stars']} ⭐ / {pr['rub']} ₽"
+
+        if plan_id == "pack15":
+            lines.append(f"• <b>{html.escape(plan['title'])}</b> — {price_txt} <i>(выгоднее)</i>")
+        elif plan_id == "pro30":
+            lines.append(
+                f"• <b>{html.escape(plan['title'])}</b> — {price_txt}\n"
+                f"  <i>{PRO30_DAILY_LIMIT} сканов/день + профиль + план роста + приоритет</i>"
+            )
+        elif plan_id == "pro_life":
+            lines.append(
+                f"• <b>{html.escape(plan['title'])}</b> — {price_txt}\n"
+                f"  <i>{PRO_LIFE_DAILY_LIMIT} сканов/день + профиль + план роста + топ-приоритет</i>"
+            )
+        else:
+            lines.append(f"• <b>{html.escape(plan['title'])}</b> — {price_txt}")
+
+    text = (
+        "<b>💎 Тарифы и сканы</b>\n\n"
+        f"{promo_banner}"
+        "<blockquote>" + "\n".join(lines) + "</blockquote>\n\n"
+        "Оплата через <b>Telegram Stars</b> активируется мгновенно."
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    for plan_id, plan in PLANS.items():
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        disc_tag = f" (-{pr['discount_pct']}%)" if pr["discount_pct"] > 0 else ""
+        markup.add(
+            InlineKeyboardButton(
+                f"{plan['title']} — {pr['stars']} ⭐ / {pr['rub']} ₽{disc_tag}",
+                callback_data=f"plan_{plan_id}",
+            )
+        )
+    markup.add(InlineKeyboardButton("🎁 Ввести промокод", callback_data="enter_promo"))
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def _build_progress_bar(current, target, width=10):
+    ratio = max(0.0, min(1.0, current / max(1, target)))
+    filled = int(round(ratio * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+def build_ref_view(user_id):
+    username = get_bot_username()
+    if not username:
+        return "⏳ Не удалось сформировать ссылку. Попробуй через пару секунд.", InlineKeyboardMarkup()
+
+    _, _, ref_count, _, _, _, _, _ = get_user_profile_stats(user_id)
+    ref_link = f"https://t.me/{username}?start=ref_{user_id}"
+    share_text = "Оцени внешность по 8-балльной шкале в Adonis PSL:"
+    share_url = f"https://t.me/share/url?url={quote(ref_link)}&text={quote(share_text)}"
+
+    ladder_lines = []
+    next_target = None
+    for req_refs, pro_days in REF_MILESTONES:
+        if ref_count >= req_refs:
+            ladder_lines.append(f"✅ <b>{req_refs} друзей</b> → PRO на {pro_days} дн.")
+        else:
+            if next_target is None:
+                next_target = (req_refs, pro_days)
+            ladder_lines.append(f"🔒 <b>{req_refs} друзей</b> → PRO на {pro_days} дн.")
+
+    if next_target:
+        req_refs, pro_days = next_target
+        bar = _build_progress_bar(ref_count, req_refs, width=10)
+        left = req_refs - ref_count
+        progress_txt = (
+            f"\nДо <b>PRO на {pro_days} дн.</b>: <code>[{bar}]</code> "
+            f"<b>{ref_count}/{req_refs}</b> (осталось {left})"
+        )
+    else:
+        progress_txt = "\n🏆 <b>Все ступени реферальной лестницы пройдены!</b>"
+
+    text = (
+        "<b>🤝 Пригласить друга</b>\n\n"
+        f"<blockquote>За каждого нового пользователя по твоей ссылке начисляется "
+        f"<b>+{REFERRAL_BONUS} бесплатный скан</b>.\n"
+        f"Приглашено друзей: <b>{ref_count}</b>{progress_txt}</blockquote>\n\n"
+        "<b>🏆 Реферальная лестница:</b>\n"
+        + "\n".join(ladder_lines)
+        + f"\n\nТвоя ссылка (нажми, чтобы скопировать):\n<code>{html.escape(ref_link)}</code>"
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("📤 Поделиться ссылкой", url=share_url))
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def build_channel_bonus_view():
+    url = get_channel_url()
+    text = (
+        f"<b>📢 Бонус +{CHANNEL_SUB_BONUS} бесплатный скан</b>\n\n"
+        "<blockquote>Подпишись на наш официальный Telegram-канал с обновлениями, разборами и промокодами, "
+        "затем нажми кнопку проверки ниже.</blockquote>"
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    if url:
+        markup.add(InlineKeyboardButton("📣 Перейти в канал", url=url))
+    markup.add(InlineKeyboardButton("✅ Проверить подписку", callback_data="check_sub"))
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def build_support_view():
+    support_url = get_support_url()
+    text = (
+        "<b>🆘 Поддержка</b>\n\n"
+        "<blockquote>Оплата через Telegram Stars начисляется автоматически за 1 секунду. "
+        "Перевод на карту (только РФ) подтверждается администратором после проверки чека.</blockquote>\n\n"
+        "Если возник вопрос по оплате или работе бота — напиши напрямую администратору:"
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    if support_url:
+        markup.add(InlineKeyboardButton("💬 Написать администратору", url=support_url))
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def send_adult_confirm(chat_id):
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("✅ Мне есть 18 лет", callback_data="confirm_18"))
+    bot.send_message(
+        chat_id,
+        "Доступ к оценке внешности разрешён только пользователям 18+.\n"
+        "Подтверди свой возраст кнопкой ниже:",
+        reply_markup=markup,
+    )
+
+
+def parse_referrer_id(text):
+    parts = (text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    m = re.match(r"^ref_(\d+)$", parts[1].strip())
+    return int(m.group(1)) if m else None
+
+
+def parse_start_promo(text):
+    parts = (text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    m = re.match(r"^promo_([A-Za-z0-9_\-]{2,24})$", parts[1].strip())
+    return m.group(1).upper() if m else None
+
+
+@bot.message_handler(commands=["start"])
+def cmd_start(message):
+    user_id = message.from_user.id
+    clear_pending_modes(user_id)
+    if is_user_banned(user_id):
+        bot.send_message(message.chat.id, "⛔ Доступ к боту ограничен.")
+        return
+    if not check_rate_limit(user_id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+
+    referrer_id = parse_referrer_id(message.text)
+    start_promo = parse_start_promo(message.text)
+    rewarded_referrer, milestone_msg = register_user_if_new(message.from_user, referrer_id=referrer_id)
+    if rewarded_referrer:
+        try:
+            ref_notice = (
+                f"🎉 По твоей ссылке присоединился новый пользователь!\n"
+                f"Начислен бонус: <b>+{REFERRAL_BONUS} бесплатный скан</b>."
+            )
+            if milestone_msg:
+                ref_notice += f"\n\n{milestone_msg}"
+            bot.send_message(rewarded_referrer, ref_notice, parse_mode="HTML")
+        except Exception as e:
+            log_error(f"Не удалось уведомить реферера {rewarded_referrer}: {e}")
+
+    if start_promo:
+        _, _, promo_msg = activate_promocode_for_user(user_id, start_promo)
+        bot.send_message(message.chat.id, promo_msg, parse_mode="HTML")
+
+    _, _, _, is_adult = get_user_access(user_id)
+    text, markup = build_main_menu_view(user_id)
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+    if not is_adult and not is_admin(user_id):
+        send_adult_confirm(message.chat.id)
+
+
+@bot.message_handler(commands=["buy"])
+def cmd_buy(message):
+    touch_user(message.from_user)
+    if is_user_banned(message.from_user.id):
+        return
+    if not check_rate_limit(message.from_user.id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+    clear_pending_modes(message.from_user.id)
+    text, markup = build_buy_menu_view(message.from_user.id)
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.message_handler(commands=["ref"])
+def cmd_ref(message):
+    touch_user(message.from_user)
+    if is_user_banned(message.from_user.id):
+        return
+    if not check_rate_limit(message.from_user.id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+    clear_pending_modes(message.from_user.id)
+    text, markup = build_ref_view(message.from_user.id)
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.message_handler(commands=["scale"])
+def cmd_scale(message):
+    touch_user(message.from_user)
+    if is_user_banned(message.from_user.id):
+        return
+    if not check_rate_limit(message.from_user.id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+    clear_pending_modes(message.from_user.id)
+    text, markup = build_psl_scale_view()
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.message_handler(commands=["paysupport"])
+def cmd_paysupport(message):
+    touch_user(message.from_user)
+    if is_user_banned(message.from_user.id):
+        return
+    if not check_rate_limit(message.from_user.id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+    clear_pending_modes(message.from_user.id)
+    text, markup = build_support_view()
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+
+def get_admin_help_text():
+    return (
+        "<b>👑 Админ-команды (через точку)</b>\n\n"
+        "<blockquote>"
+        "• <code>. создать промокод 10% ADONIS 50 24ч</code> — создать промо\n"
+        "  <i>Награда: 10% / 2скана / 3pro | лимит и время (30м/24ч/7д) опц.</i>\n"
+        "• <code>. промокоды</code> — список промокодов и активаций\n"
+        "• <code>. удалить промокод ADONIS</code> — отключить промокод\n"
+        "• <code>. выдать всем 1</code> — выдать +N сканов всем пользователям\n"
+        "• <code>. забрать у всех 1</code> / <code>все</code> — списать N (или все) сканы у всех\n"
+        "• <code>. забрать стартовый</code> — забрать 1 неиспользованный старт-скан у новичков\n"
+        "• <code>. выдать сканы @user 10</code> / <code>. забрать сканы @user 5</code>\n"
+        "• <code>. выдать премиум @user 30</code> / <code>навсегда</code>\n"
+        "• <code>. забрать премиум @user</code> — снять PRO\n"
+        "• <code>. модель</code> — меню смены модели Gemini (или <code>. модель имя</code>)\n"
+        "• <code>. стата</code> — сводка по боту (+ сканы за сегодня)\n"
+        "• <code>. юзеры [15]</code> — последние пользователи и их активность\n"
+        "• <code>. инфо @user</code> — досье по юзеру\n"
+        "• <code>. рассылка</code> — рассылка с предпросмотром\n"
+        "• <code>. бан @user</code> / <code>. разбан @user</code>\n"
+        "• <code>. очистить кэш</code> — сбросить кэш фото\n"
+        "• <code>. админ</code> — эта шпаргалка"
+        "</blockquote>\n\n"
+        "Вместо <code>@user</code> можно указывать числовой <code>ID</code>."
+    )
+
+
+def build_model_manager_view():
+    active = get_active_models()
+    active_str = "\n".join(f"• <code>{html.escape(m)}</code>" for m in active)
+    text = (
+        "<b>🤖 Управление моделью Gemini</b>\n\n"
+        f"<blockquote>Активная сейчас:\n{active_str}</blockquote>\n\n"
+        "Выбери быстрый пресет кнопкой ниже, введи свою модель вручную "
+        "или напиши команду:\n"
+        "<code>. модель gemini-3.5-flash-lite</code>\n"
+        "<i>Можно указать несколько через запятую (запасной фолбэк).</i>"
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    for preset in PRESET_MODELS:
+        prefix = "✅ " if active == [preset] else ""
+        markup.add(InlineKeyboardButton(f"{prefix}{preset}", callback_data=f"setmodel_{preset}"))
+    markup.add(InlineKeyboardButton("✏️ Ввести свою модель", callback_data="model_custom"))
+    markup.add(InlineKeyboardButton("🔄 Сбросить паузу 404/429", callback_data="model_reset_cd"))
+    markup.add(InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
+    return text, markup
+
+
+def get_bot_stats_text():
+    now = int(time.time())
+    today = get_today_str()
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        total = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE date(created_at, 'localtime') = ?", (today,))
+        new_today = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(pro_tier, 0) = 1 AND pro_until > ?", (now,))
+        pro30_cnt = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(pro_tier, 0) >= 2")
+        pro_life_cnt = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(is_banned, 0) = 1")
+        banned_cnt = c.fetchone()[0]
+        c.execute("SELECT COALESCE(SUM(scans_count), 0), COALESCE(SUM(referrals_count), 0) FROM users")
+        total_scans, total_refs = c.fetchone()
+        c.execute("SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM stars_payments")
+        stars_cnt, stars_sum = c.fetchone()
+        c.execute("SELECT COUNT(*) FROM payment_requests WHERE status = 'approved'")
+        card_cnt = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM photo_cache")
+        cached = c.fetchone()[0]
+        c.execute("SELECT COALESCE(scans, 0) FROM daily_stats WHERE day = ?", (today,))
+        row_today = c.fetchone()
+        scans_today = row_today[0] if row_today else 0
+        c.execute(
+            """
+            SELECT COUNT(*) FROM promocodes
+            WHERE is_active = 1
+              AND (expires_at = 0 OR expires_at > ?)
+              AND (max_uses = 0 OR used_count < max_uses)
+            """,
+            (now,),
+        )
+        active_promos = c.fetchone()[0]
+
+    mp_status = "✅ активен" if is_mediapipe_available() else "⚠️ визуальный режим"
+    models_str = ", ".join(get_active_models())
+    return (
+        "<b>📊 Статистика ADONIS PSL</b>\n\n"
+        "<blockquote>"
+        f"Пользователей: <b>{total}</b> (новых сегодня: <b>+{new_today}</b>)\n"
+        f"PRO 30д: <b>{pro30_cnt}</b> | PRO Навсегда: <b>{pro_life_cnt}</b> | Бан: <b>{banned_cnt}</b>\n"
+        f"Всего сканов: <b>{total_scans}</b> (сегодня: <b>+{scans_today}</b>) | Рефералов: <b>{total_refs}</b>\n"
+        f"Stars: <b>{stars_cnt}</b> ({stars_sum} ⭐) | Картой: <b>{card_cnt}</b>\n"
+        f"Очередь: <b>{_scan_queue.qsize()}</b> | Кэш фото: <b>{cached}</b> | Промо: <b>{active_promos}</b>\n"
+        f"Модели: <code>{html.escape(models_str)}</code>\n"
+        f"MediaPipe 468 точек: <b>{mp_status}</b>"
+        "</blockquote>"
+    )
+
+
+def build_user_dossier_text(target_id):
+    free_limit, pro_tier, pro_until, is_adult = get_user_access(target_id)
+    scans_cnt, best_score, ref_count, uname, fname, banned, last_score, prev_score = get_user_profile_stats(target_id)
+
+    extra_str = f" + {free_limit} доп." if free_limit > 0 else ""
+    if pro_tier >= 2:
+        tier_str = f"💎 PRO Навсегда (сегодня {get_pro_remaining_today(target_id, pro_tier)}/{PRO_LIFE_DAILY_LIMIT}{extra_str})"
+    elif pro_tier == 1:
+        tier_str = f"👑 PRO до {format_date_from_ts(pro_until)} (сегодня {get_pro_remaining_today(target_id, pro_tier)}/{PRO30_DAILY_LIMIT}{extra_str})"
+    else:
+        tier_str = f"⚡ Базовый (сканов: {free_limit})"
+
+    uname_str = f"@{uname}" if uname else "нет"
+    ban_str = "⛔ Забанен" if banned else "✅ Активен"
+    best_str = f"{best_score:.1f}/8" if best_score > 0 else "—"
+    last_str = f"{last_score:.1f}/8" if last_score > 0 else "—"
+    if last_score > 0 and prev_score > 0:
+        d = round(last_score - prev_score, 1)
+        last_str += f" ({d:+.1f})"
+
+    return (
+        f"<b>🗂 Досье пользователя</b>\n\n"
+        "<blockquote>"
+        f"ID: <code>{target_id}</code>\n"
+        f"Username: {html.escape(uname_str)}\n"
+        f"Имя: {html.escape(fname or '—')}\n"
+        f"Статус: {ban_str} | 18+: {'да' if is_adult else 'нет'}\n"
+        f"Тариф: {tier_str}\n"
+        f"Сканов всего: <b>{scans_cnt}</b> | Лучший: <b>{best_str}</b> | Последний: <b>{last_str}</b>\n"
+        f"Рефералов: <b>{ref_count}</b>"
+        "</blockquote>"
+    )
+
+
+@bot.message_handler(commands=["admin"])
+def cmd_admin_slash(message):
+    if is_admin(message.from_user.id):
+        bot.reply_to(message, get_admin_help_text(), parse_mode="HTML")
+
+
+@bot.message_handler(commands=["model", "models"])
+def cmd_model_slash(message):
+    if not is_admin(message.from_user.id):
+        return
+    clear_pending_modes(message.from_user.id)
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 2 and parts[1].strip():
+        arg = parts[1].strip()
+        if arg.lower() in ("сброс", "reset", "default"):
+            saved = set_active_models(DEFAULT_MODELS)
+            bot.reply_to(
+                message,
+                f"✅ Модель сброшена на стандартную: <code>{html.escape(', '.join(saved))}</code>",
+                parse_mode="HTML",
+            )
+            return
+        parsed = parse_models_input(arg)
+        if not parsed:
+            bot.reply_to(
+                message,
+                "⚠️ Некорректное имя модели. Пример: <code>/model gemini-3.5-flash-lite</code>",
+                parse_mode="HTML",
+            )
+            return
+        saved = set_active_models(parsed)
+        bot.reply_to(
+            message,
+            f"✅ Активная модель обновлена:\n<code>{html.escape(', '.join(saved))}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    text, markup = build_model_manager_view()
+    bot.reply_to(message, text, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.message_handler(commands=["stats"])
+def cmd_stats_slash(message):
+    if is_admin(message.from_user.id):
+        bot.reply_to(message, get_bot_stats_text(), parse_mode="HTML")
+
+
+@bot.message_handler(commands=["clear_cache"])
+def cmd_clear_cache_slash(message):
+    if not is_admin(message.from_user.id):
+        return
+    with db_conn() as conn:
+        conn.cursor().execute("DELETE FROM photo_cache")
+    bot.reply_to(message, "✅ Кэш фото очищен.")
+
+
+@bot.message_handler(
+    func=lambda m: bool(
+        m.text
+        and m.text.lstrip().startswith(".")
+        and is_admin(m.from_user.id)
+        and not is_awaiting_broadcast(m.from_user.id)
+        and not is_awaiting_model(m.from_user.id)
+        and not is_awaiting_promo(m.from_user.id)
+    ),
+    content_types=["text"],
+)
+def handle_admin_dot_commands(message):
+    user_id = message.from_user.id
+    body = re.sub(r"\s+", " ", message.text.lstrip()[1:].strip())
+    low = body.lower()
+
+    if low in ("админ", "admin", "помощь", "help"):
+        bot.reply_to(message, get_admin_help_text(), parse_mode="HTML")
+        return
+
+    if low in ("стата", "статистика", "stats"):
+        bot.reply_to(message, get_bot_stats_text(), parse_mode="HTML")
+        return
+
+    m_users = re.match(r"^(?:юзеры|пользователи|users)(?:\s+(\d+))?$", body, flags=re.IGNORECASE)
+    if m_users:
+        lim = max(1, min(30, int(m_users.group(1)))) if m_users.group(1) else 15
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                """
+                SELECT user_id, COALESCE(username, ''), COALESCE(first_name, ''),
+                       COALESCE(free_limit, 0), COALESCE(pro_tier, 0),
+                       COALESCE(scans_count, 0), COALESCE(best_score, 0.0)
+                FROM users
+                ORDER BY created_at DESC, user_id DESC
+                LIMIT ?
+                """,
+                (lim,),
+            )
+            rows = c.fetchall()
+        if not rows:
+            bot.reply_to(message, "Пользователей пока нет.")
+            return
+        lines = []
+        for uid, uname, fname, flim, ptier, scnt, bscore in rows:
+            tag = f"@{uname}" if uname else (fname or str(uid))
+            tier_icon = "💎" if ptier >= 2 else ("👑" if ptier == 1 else "⚡")
+            score_part = f" | max {bscore:.1f}" if bscore > 0 else ""
+            lines.append(
+                f"{tier_icon} <code>{uid}</code> ({html.escape(tag[:20])}) — "
+                f"баланс: <b>{flim}</b> | сканов: <b>{scnt}</b>{score_part}"
+            )
+        bot.reply_to(
+            message,
+            f"<b>👥 Последние {len(rows)} пользователей</b>\n\n<blockquote>" + "\n".join(lines) + "</blockquote>",
+            parse_mode="HTML",
+        )
+        return
+
+    m_give_all = re.match(
+        r"^выдать\s+всем(?:\s+(?:сканы|сканов|рейты|рейтов))?\s+(\d+)$",
+        body,
+        flags=re.IGNORECASE,
+    )
+    if m_give_all:
+        amount = int(m_give_all.group(1))
+        if amount <= 0 or amount > 1000:
+            bot.reply_to(message, "⚠️ Укажи число от 1 до 1000.")
+            return
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                "UPDATE users SET free_limit = free_limit + ? WHERE COALESCE(is_banned, 0) = 0",
+                (amount,),
+            )
+            affected = c.rowcount
+        bot.reply_to(
+            message,
+            f"✅ Выдано <b>+{amount} сканов</b> всем активным пользователям (затронуто: <b>{affected}</b>).",
+            parse_mode="HTML",
+        )
+        return
+
+    m_take_all = re.match(
+        r"^(?:забрать\s+у\s+всех|списать\s+у\s+всех)(?:\s+(?:сканы|сканов|рейты|рейтов))?\s+(\S+)$",
+        body,
+        flags=re.IGNORECASE,
+    )
+    if m_take_all:
+        arg = m_take_all.group(1).lower()
+        if arg in ("все", "всё", "all", "0"):
+            with db_conn() as conn:
+                c = conn.cursor()
+                c.execute("UPDATE users SET free_limit = 0 WHERE free_limit > 0")
+                affected = c.rowcount
+            bot.reply_to(
+                message,
+                f"🗑 Все сканы (free_limit) обнулены у <b>{affected}</b> пользователей.",
+                parse_mode="HTML",
+            )
+            return
+        if not arg.isdigit() or int(arg) <= 0:
+            bot.reply_to(
+                message,
+                "⚠️ Укажи число (> 0) или слово <code>все</code>. Пример: <code>. забрать у всех 1</code>",
+                parse_mode="HTML",
+            )
+            return
+        amount = int(arg)
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                "UPDATE users SET free_limit = MAX(0, free_limit - ?) WHERE free_limit > 0",
+                (amount,),
+            )
+            affected = c.rowcount
+        bot.reply_to(
+            message,
+            f"✅ Списано до <b>-{amount} сканов</b> у всех пользователей с балансом (затронуто: <b>{affected}</b>).",
+            parse_mode="HTML",
+        )
+        return
+
+    if low in ("забрать стартовый", "снять стартовый"):
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                """
+                UPDATE users
+                SET free_limit = MAX(0, free_limit - 1)
+                WHERE free_limit > 0
+                  AND COALESCE(scans_count, 0) = 0
+                  AND COALESCE(pro_tier, 0) = 0
+                  AND COALESCE(channel_bonus_claimed, 0) = 0
+                  AND COALESCE(referrals_count, 0) = 0
+                """
+            )
+            affected = c.rowcount
+        bot.reply_to(
+            message,
+            f"✅ Неиспользованный стартовый скан списан у <b>{affected}</b> новичков "
+            "(подписчики ТГК, реферальные и купленные сканы не затронуты).",
+            parse_mode="HTML",
+        )
+        return
+
+    if low in ("очистить кэш", "кэш", "clear_cache"):
+        with db_conn() as conn:
+            conn.cursor().execute("DELETE FROM photo_cache")
+        bot.reply_to(message, "✅ Кэш фото очищен.")
+        return
+
+    if low in ("промокоды", "промо", "promos"):
+        rows = list_promocodes_db(limit=25)
+        if not rows:
+            bot.reply_to(
+                message,
+                "🎁 Промокодов пока нет.\n"
+                "Создать: <code>. создать промокод 10% ADONIS 50 24ч</code>",
+                parse_mode="HTML",
+            )
+            return
+        now = int(time.time())
+        lines = []
+        for code, ptype, val, max_u, used_c, exp_at, is_act in rows:
+            expired = bool(exp_at > 0 and now >= exp_at)
+            exhausted = bool(max_u > 0 and used_c >= max_u)
+            icon = "✅" if (is_act and not expired and not exhausted) else "⛔"
+            lim_str = f"{used_c}/{max_u}" if max_u > 0 else f"{used_c}/∞"
+            time_str = format_time_left(exp_at)
+            lines.append(
+                f"{icon} <code>{html.escape(code)}</code> — {format_promo_reward(ptype, val)} "
+                f"| {lim_str} | {time_str}"
+            )
+        bot.reply_to(
+            message,
+            "<b>🎁 Промокоды</b>\n\n<blockquote>" + "\n".join(lines) + "</blockquote>",
+            parse_mode="HTML",
+        )
+        return
+
+    m_del_promo = re.match(r"^(?:удалить|отключить)\s+промокод\s+(\S+)$", body, flags=re.IGNORECASE)
+    if m_del_promo:
+        code = m_del_promo.group(1).strip().upper()
+        if deactivate_promocode_db(code):
+            bot.reply_to(message, f"🗑 Промокод <code>{html.escape(code)}</code> отключён.", parse_mode="HTML")
+        else:
+            bot.reply_to(message, f"⚠️ Промокод <code>{html.escape(code)}</code> не найден.", parse_mode="HTML")
+        return
+
+    m_new_promo = re.match(r"^создать\s+промокод\s+(.+)$", body, flags=re.IGNORECASE)
+    if m_new_promo:
+        tokens = m_new_promo.group(1).strip().split()
+        if len(tokens) < 2:
+            bot.reply_to(
+                message,
+                "⚠️ Формат: <code>. создать промокод 10% ADONIS [лимит] [время]</code>\n"
+                "Примеры:\n"
+                "• <code>. создать промокод 10% ADONIS 50 24ч</code>\n"
+                "• <code>. создать промокод 2скана START 100 7д</code>\n"
+                "• <code>. создать промокод 3pro VIP 20</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        ptype, pval = parse_promo_reward_token(tokens[0])
+        if not ptype:
+            bot.reply_to(
+                message,
+                "⚠️ Некорректная награда. Укажи: <code>10%</code> (1–90%), <code>2скана</code> или <code>3pro</code>.",
+                parse_mode="HTML",
+            )
+            return
+
+        code = tokens[1].strip().upper()
+        if not re.fullmatch(r"[A-Z0-9_\-]{2,24}", code):
+            bot.reply_to(
+                message,
+                "⚠️ Код должен быть длиной 2–24 символа (только латиница, цифры, _ или -).",
+                parse_mode="HTML",
+            )
+            return
+
+        max_uses = 0
+        duration_sec = 0
+        for extra in tokens[2:]:
+            if extra.isdigit():
+                max_uses = int(extra)
+                continue
+            parsed_dur = parse_promo_duration_token(extra)
+            if parsed_dur is not None:
+                duration_sec = parsed_dur
+                continue
+            bot.reply_to(
+                message,
+                f"⚠️ Не понял параметр <code>{html.escape(extra)}</code>.\n"
+                "Лимит — число (например <code>50</code>), время — <code>30м</code>, <code>24ч</code> или <code>7д</code>.",
+                parse_mode="HTML",
+            )
+            return
+
+        expires_at = create_promocode_db(code, ptype, pval, max_uses=max_uses, duration_sec=duration_sec)
+        uname = get_bot_username()
+        link_line = (
+            f"\nСсылка автоактивации:\n<code>https://t.me/{uname}?start=promo_{code}</code>"
+            if uname
+            else ""
+        )
+        lim_txt = f"{max_uses} активаций" if max_uses > 0 else "безлимит"
+        exp_txt = f"до {format_datetime_from_ts(expires_at)} ({format_time_left(expires_at)})" if expires_at > 0 else "бессрочно"
+        bot.reply_to(
+            message,
+            f"✅ <b>Промокод создан!</b>\n\n"
+            f"<blockquote>Код: <code>{html.escape(code)}</code>\n"
+            f"Награда: <b>{format_promo_reward(ptype, pval)}</b>\n"
+            f"Лимит: <b>{lim_txt}</b>\n"
+            f"Срок: <b>{exp_txt}</b></blockquote>"
+            f"{link_line}",
+            parse_mode="HTML",
+        )
+        return
+
+    m_model = re.match(r"^(?:модель|модели|model|models)(?:\s+(.+))?$", body, flags=re.IGNORECASE)
+    if m_model:
+        clear_pending_modes(user_id)
+        arg = (m_model.group(1) or "").strip()
+        if not arg:
+            text, markup = build_model_manager_view()
+            bot.reply_to(message, text, parse_mode="HTML", reply_markup=markup)
+            return
+        if arg.lower() in ("сброс", "reset", "default"):
+            saved = set_active_models(DEFAULT_MODELS)
+            bot.reply_to(
+                message,
+                f"✅ Модель сброшена на стандартную: <code>{html.escape(', '.join(saved))}</code>",
+                parse_mode="HTML",
+            )
+            return
+        parsed = parse_models_input(arg)
+        if not parsed:
+            bot.reply_to(
+                message,
+                "⚠️ Некорректное название модели. Пример: <code>. модель gemini-3.5-flash-lite</code>",
+                parse_mode="HTML",
+            )
+            return
+        saved = set_active_models(parsed)
+        bot.reply_to(
+            message,
+            f"✅ Активная модель обновлена и сохранена:\n<code>{html.escape(', '.join(saved))}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    if low == "рассылка":
+        clear_pending_modes(user_id)
+        with _broadcast_lock:
+            _broadcast_state[user_id] = {"step": "await_content"}
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="bc_cancel"))
+        bot.reply_to(
+            message,
+            "📢 <b>Режим рассылки</b>\n\n"
+            "Отправь следующим сообщением <b>текст</b> или <b>фото с подписью</b>. "
+            "Я покажу предпросмотр с кнопкой подтверждения перед отправкой.",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return
+
+    m_grant = re.match(r"^выдать\s+премиум\s+(\S+)(?:\s+(\S+))?$", body, flags=re.IGNORECASE)
+    if m_grant:
+        target_id = resolve_target_user(m_grant.group(1))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе. Укажи ID или дождись, пока он напишет боту.")
+            return
+        dur_raw = (m_grant.group(2) or "навсегда").lower()
+        ensure_user(target_id)
+
+        if dur_raw in ("навсегда", "0", "life", "forever"):
+            with db_conn() as conn:
+                conn.cursor().execute(
+                    "UPDATE users SET is_premium = 1, pro_tier = 2, pro_until = 0 WHERE user_id = ?",
+                    (target_id,),
+                )
+            bot.reply_to(message, f"✅ Выдан <b>PRO Навсегда</b> для <code>{target_id}</code>.", parse_mode="HTML")
+            try:
+                bot.send_message(target_id, "💎 Тебе активирован <b>PRO Навсегда</b>!", parse_mode="HTML")
+            except Exception:
+                pass
+            return
+
+        if not dur_raw.isdigit() or int(dur_raw) <= 0:
+            bot.reply_to(message, "⚠️ Укажи число дней (> 0) или слово <code>навсегда</code>.", parse_mode="HTML")
+            return
+
+        days = int(dur_raw)
+        now = int(time.time())
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                "SELECT COALESCE(pro_tier, 0), COALESCE(pro_until, 0) FROM users WHERE user_id = ?",
+                (target_id,),
+            )
+            row = c.fetchone()
+            cur_tier = row[0] if row else 0
+            cur_until = row[1] if row else 0
+            if cur_tier >= 2:
+                bot.reply_to(
+                    message,
+                    f"ℹ️ У <code>{target_id}</code> уже активен <b>PRO Навсегда</b>. "
+                    "Чтобы снять его, используй <code>. забрать премиум</code>.",
+                    parse_mode="HTML",
+                )
+                return
+            base = max(now, cur_until) if cur_tier == 1 else now
+            until_ts = base + days * 86400
+            c.execute(
+                "UPDATE users SET is_premium = 1, pro_tier = 1, pro_until = ? WHERE user_id = ?",
+                (until_ts, target_id),
+            )
+        bot.reply_to(
+            message,
+            f"✅ Выдан <b>PRO на {days} дн.</b> (до {format_date_from_ts(until_ts)}) для <code>{target_id}</code>.",
+            parse_mode="HTML",
+        )
+        try:
+            bot.send_message(
+                target_id,
+                f"👑 Тебе активирован <b>PRO на {days} дн.</b> (до {format_date_from_ts(until_ts)})!",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return
+
+    m_rev = re.match(r"^забрать\s+премиум\s+(\S+)$", body, flags=re.IGNORECASE)
+    if m_rev:
+        target_id = resolve_target_user(m_rev.group(1))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        ensure_user(target_id)
+        with db_conn() as conn:
+            conn.cursor().execute(
+                "UPDATE users SET is_premium = 0, pro_tier = 0, pro_until = 0 WHERE user_id = ?",
+                (target_id,),
+            )
+        bot.reply_to(message, f"❌ PRO снят у <code>{target_id}</code>.", parse_mode="HTML")
+        return
+
+    m_scans = re.match(r"^выдать\s+сканы\s+(\S+)\s+(\d+)$", body, flags=re.IGNORECASE)
+    if m_scans:
+        target_id = resolve_target_user(m_scans.group(1))
+        amount = int(m_scans.group(2))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        if amount <= 0:
+            bot.reply_to(message, "⚠️ Количество сканов должно быть больше 0.")
+            return
+        ensure_user(target_id)
+        with db_conn() as conn:
+            conn.cursor().execute(
+                "UPDATE users SET free_limit = free_limit + ? WHERE user_id = ?",
+                (amount, target_id),
+            )
+        bot.reply_to(message, f"✅ Начислено <b>+{amount} сканов</b> юзеру <code>{target_id}</code>.", parse_mode="HTML")
+        try:
+            bot.send_message(target_id, f"⚡ Тебе начислено <b>+{amount} сканов</b> на баланс!", parse_mode="HTML")
+        except Exception:
+            pass
+        return
+
+    m_take_user = re.match(
+        r"^забрать\s+(?:сканы|рейты)\s+(\S+)\s+(\S+)$",
+        body,
+        flags=re.IGNORECASE,
+    )
+    if m_take_user:
+        target_id = resolve_target_user(m_take_user.group(1))
+        arg = m_take_user.group(2).lower()
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        ensure_user(target_id)
+        if arg in ("все", "всё", "all", "0"):
+            with db_conn() as conn:
+                conn.cursor().execute("UPDATE users SET free_limit = 0 WHERE user_id = ?", (target_id,))
+            bot.reply_to(message, f"🗑 Все сканы обнулены у <code>{target_id}</code>.", parse_mode="HTML")
+            return
+        if not arg.isdigit() or int(arg) <= 0:
+            bot.reply_to(message, "⚠️ Укажи число (> 0) или <code>все</code>.", parse_mode="HTML")
+            return
+        amount = int(arg)
+        with db_conn() as conn:
+            conn.cursor().execute(
+                "UPDATE users SET free_limit = MAX(0, free_limit - ?) WHERE user_id = ?",
+                (amount, target_id),
+            )
+        bot.reply_to(message, f"✅ Списано до <b>-{amount} сканов</b> у <code>{target_id}</code>.", parse_mode="HTML")
+        return
+
+    m_info = re.match(r"^инфо\s+(\S+)$", body, flags=re.IGNORECASE)
+    if m_info:
+        target_id = resolve_target_user(m_info.group(1))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        bot.reply_to(message, build_user_dossier_text(target_id), parse_mode="HTML")
+        return
+
+    m_ban = re.match(r"^(бан|разбан)\s+(\S+)$", body, flags=re.IGNORECASE)
+    if m_ban:
+        action = m_ban.group(1).lower()
+        target_id = resolve_target_user(m_ban.group(2))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        if is_admin(target_id):
+            bot.reply_to(message, "⚠️ Нельзя забанить администратора.")
+            return
+        ensure_user(target_id)
+        ban_val = 1 if action == "бан" else 0
+        with db_conn() as conn:
+            conn.cursor().execute("UPDATE users SET is_banned = ? WHERE user_id = ?", (ban_val, target_id))
+        msg = f"⛔ Пользователь <code>{target_id}</code> забанен." if ban_val else f"✅ Пользователь <code>{target_id}</code> разбанен."
+        bot.reply_to(message, msg, parse_mode="HTML")
+        return
+
+    bot.reply_to(message, "⚠️ Неизвестная команда. Напиши <code>. админ</code> для списка.", parse_mode="HTML")
+
+
+def _prepare_broadcast_preview(message):
+    user_id = message.from_user.id
+    with _broadcast_lock:
+        state = _broadcast_state.get(user_id)
+    if not state or state.get("step") != "await_content":
+        return False
+
+    if message.content_type == "photo":
+        payload = {
+            "step": "ready",
+            "type": "photo",
+            "file_id": message.photo[-1].file_id,
+            "caption": message.caption or "",
+        }
+    elif message.content_type == "text":
+        payload = {
+            "step": "ready",
+            "type": "text",
+            "text": message.text,
+        }
+    else:
+        bot.reply_to(message, "⚠️ Для рассылки отправь текст или фото с подписью.")
+        return True
+
+    with _broadcast_lock:
+        _broadcast_state[user_id] = payload
+
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(is_banned, 0) = 0")
+        total_targets = c.fetchone()[0]
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton(f"✅ Отправить ({total_targets})", callback_data="bc_send"),
+        InlineKeyboardButton("❌ Отмена", callback_data="bc_cancel"),
+    )
+
+    bot.send_message(message.chat.id, "👁 <b>Предпросмотр рассылки:</b>", parse_mode="HTML")
+    if payload["type"] == "photo":
+        bot.send_photo(message.chat.id, payload["file_id"], caption=payload["caption"], reply_markup=markup)
+    else:
+        bot.send_message(message.chat.id, payload["text"], reply_markup=markup)
+    return True
+
+
+def _send_broadcast_item(uid, payload):
+    if payload["type"] == "photo":
+        bot.send_photo(uid, payload["file_id"], caption=payload["caption"])
+    else:
+        bot.send_message(uid, payload["text"])
+
+
+def _run_broadcast_worker(admin_chat_id, payload):
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM users WHERE COALESCE(is_banned, 0) = 0")
+        user_ids = [row[0] for row in c.fetchall()]
+
+    ok_cnt, fail_cnt = 0, 0
+    for uid in user_ids:
+        sent = False
+        for attempt in range(2):
+            try:
+                _send_broadcast_item(uid, payload)
+                sent = True
+                break
+            except telebot.apihelper.ApiTelegramException as api_err:
+                if getattr(api_err, "error_code", None) == 429 and attempt == 0:
+                    retry_after = 3
+                    try:
+                        retry_after = int((api_err.result_json or {}).get("parameters", {}).get("retry_after", 3))
+                    except Exception:
+                        retry_after = 3
+                    time.sleep(min(max(1, retry_after), 60) + 0.5)
+                    continue
+                break
+            except Exception:
+                break
+        if sent:
+            ok_cnt += 1
+        else:
+            fail_cnt += 1
+        time.sleep(0.05)
+
+    try:
+        bot.send_message(
+            admin_chat_id,
+            f"📢 <b>Рассылка завершена!</b>\n"
+            f"Доставлено: <b>{ok_cnt}</b> | Ошибок/блок: <b>{fail_cnt}</b>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
+@bot.message_handler(
+    func=lambda m: is_admin(m.from_user.id) and is_awaiting_broadcast(m.from_user.id),
+    content_types=["text", "photo"],
+)
+def handle_admin_broadcast_input(message):
+    _prepare_broadcast_preview(message)
+
+
+@bot.message_handler(
+    func=lambda m: is_admin(m.from_user.id) and is_awaiting_model(m.from_user.id),
+    content_types=["text"],
+)
+def handle_admin_model_input(message):
+    user_id = message.from_user.id
+    parsed = parse_models_input(message.text)
+    if not parsed:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="model_cancel"))
+        bot.reply_to(
+            message,
+            "⚠️ Некорректное имя модели. Введи название латиницей, например:\n"
+            "<code>gemini-3.5-flash-lite</code>\n"
+            "<i>Или несколько моделей через запятую.</i>",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return
+
+    clear_awaiting_model(user_id)
+    saved = set_active_models(parsed)
+    text, markup = build_model_manager_view()
+    bot.reply_to(
+        message,
+        f"✅ Модель обновлена и сохранена: <code>{html.escape(', '.join(saved))}</code>\n\n{text}",
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
+
+
+def build_report_markup(photo_hash, include_profile_btn=True, is_profile=False):
+    markup = InlineKeyboardMarkup(row_width=2)
+    if photo_hash:
+        btn_label = "📊 Подробный разбор профиля" if is_profile else "📊 Подробный разбор"
+        markup.add(InlineKeyboardButton(btn_label, callback_data=f"full_{photo_hash}"))
+        if not is_profile:
+            markup.add(InlineKeyboardButton("📈 План роста (PRO)", callback_data=f"growth_{photo_hash}"))
+    row2 = []
+    if include_profile_btn and not is_profile:
+        row2.append(InlineKeyboardButton("📐 Профиль (PRO)", callback_data="profile_scan"))
+    row2.append(InlineKeyboardButton("📖 Шкала", callback_data="psl_scale_new"))
+    row2.append(InlineKeyboardButton("🏠 Меню", callback_data="main_menu_new"))
+    markup.add(*row2)
+    return markup
+
+
+def _run_growth_plan_worker(chat_id, user_id, photo_hash, scores_text, full_text, status_msg):
+    try:
+        report_context = f"{scores_text}\n\n{full_text}".strip()[:4500]
+        prompt = GROWTH_PLAN_PROMPT.format(report_context=report_context)
+        plan_text, _ = run_gemini_text_pipeline(prompt)
+        delete_status_safe(chat_id, status_msg)
+
+        if not plan_text:
+            bot.send_message(
+                chat_id,
+                "⏳ Не удалось сгенерировать план роста прямо сейчас — попробуй нажать кнопку через минуту.",
+            )
+            return
+
+        cache_set_growth_plan(photo_hash, plan_text)
+        send_long_html(chat_id, "📈 Персональный план роста (PRO)", plan_text)
+    except Exception as e:
+        log_error(f"Ошибка в _run_growth_plan_worker: {e}")
+        delete_status_safe(chat_id, status_msg)
+        bot.send_message(chat_id, "⏳ Технический сбой при генерации плана роста. Попробуй ещё раз.")
+    finally:
+        with _growth_busy_lock:
+            _growth_busy.discard((user_id, photo_hash))
+
+
+def _build_front_caption(scores_text, verdict="", limit_info="", delta_line=""):
+    score = extract_final_score(scores_text)
+    m_cat = re.search(r"(?im)^Категория[:\s]+(.+)$", scores_text)
+    cat = m_cat.group(1).strip() if m_cat else (category_by_score(score) if score else "")
+    head = (
+        f"<b>Результат: {score:.1f}/8 • {html.escape(cat)}</b>"
+        if score is not None
+        else "<b>Карточка анализа лица готова</b>"
+    )
+    delta_block = f"\n{html.escape(delta_line)}" if delta_line else ""
+    quote_block = f"\n<blockquote>{html.escape(verdict)}</blockquote>" if verdict else ""
+    return f"{head}{delta_block}{quote_block}{limit_info}"
+
+
+def _build_profile_caption(scores_text, verdict="", limit_info=""):
+    score = extract_final_score(scores_text)
+    m_cat = re.search(r"(?im)^Категория[:\s]+(.+)$", scores_text)
+    cat = m_cat.group(1).strip() if m_cat else (category_by_score(score) if score else "")
+    head = (
+        f"<b>📐 Профиль: {score:.1f}/8 • {html.escape(cat)}</b>"
+        if score is not None
+        else "<b>📐 Анализ бокового профиля готов</b>"
+    )
+    quote_block = f"\n<blockquote>{html.escape(verdict)}</blockquote>" if verdict else ""
+    return f"{head}{quote_block}{limit_info}"
+
+
+def _send_report_card_or_text(
+    chat_id,
+    card_bytes,
+    scores_text,
+    full_text,
+    photo_hash,
+    verdict="",
+    limit_info="",
+    delta_line="",
+    is_profile=False,
+    card_file_id="",
+):
+    markup = build_report_markup(
+        photo_hash if full_text else None,
+        include_profile_btn=not is_profile,
+        is_profile=is_profile,
+    )
+    if not verdict:
+        verdict = extract_verdict(scores_text)
+
+    caption = (
+        _build_profile_caption(scores_text, verdict=verdict, limit_info=limit_info)
+        if is_profile
+        else _build_front_caption(scores_text, verdict=verdict, limit_info=limit_info, delta_line=delta_line)
+    )
+
+    if card_file_id:
+        try:
+            bot.send_photo(chat_id, card_file_id, caption=caption, parse_mode="HTML", reply_markup=markup)
+            return card_file_id
+        except Exception as e:
+            log_error(f"Не удалось отправить карточку по file_id, пробую резерв: {e}")
+
+    if card_bytes:
+        try:
+            with io.BytesIO(card_bytes) as bio:
+                bio.name = "adonis_psl_card.jpg"
+                sent = bot.send_photo(chat_id, bio, caption=caption, parse_mode="HTML", reply_markup=markup)
+            if sent and getattr(sent, "photo", None):
+                return sent.photo[-1].file_id
+            return ""
+        except Exception as e:
+            log_error(f"Не удалось отправить карточку, шлю текстом: {e}")
+
+    title = "Анализ бокового профиля:" if is_profile else "Экспресс-оценка лица:"
+    delta_block = f"\n{html.escape(delta_line)}" if delta_line else ""
+    bot.send_message(
+        chat_id,
+        f"<b>{title}</b>{delta_block}\n\n<blockquote>{html.escape(scores_text)}</blockquote>{limit_info}",
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
+    return ""
+
+
+def _format_full_breakdown(full_text, geom=None):
+    parts = []
+    if geom and geom.get("metrics"):
+        title = "📐 Пропорции (468 точек лица):" if geom.get("source") == "mediapipe" else "📐 Пропорции лица:"
+        lines = [title]
+        for m in geom["metrics"]:
+            if m.get("display"):
+                lines.append(f"• {m['name']}: {m['display']} — {m['status']} ({m['norm']})")
+            else:
+                lines.append(f"• {m['name']}: {m['status']} ({m['norm']})")
+        lines.append(f"• Симметрия: {geom['symmetry_pct']:.1f}% — {geom['symmetry_status']}")
+        if geom.get("face_shape"):
+            lines.append(f"• Форма лица: {geom['face_shape']}")
+        parts.append("\n".join(lines))
+    if full_text:
+        parts.append(full_text.strip())
+    return "\n\n".join(parts)
+
+
+def _send_no_scans_prompt(chat_id, user_id=None):
+    has_sub_bonus = (
+        user_id is not None
+        and is_channel_bonus_enabled()
+        and not is_channel_bonus_claimed(user_id)
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    if has_sub_bonus:
+        markup.add(
+            InlineKeyboardButton(
+                f"📢 +{CHANNEL_SUB_BONUS} скан за подписку на канал",
+                callback_data="channel_bonus",
+            )
+        )
+    markup.add(InlineKeyboardButton(f"🤝 Пригласить друга (+{REFERRAL_BONUS} скан)", callback_data="get_ref"))
+    markup.add(InlineKeyboardButton("💎 Купить сканы / PRO", callback_data="buy_menu"))
+    markup.add(InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
+
+    if has_sub_bonus:
+        msg = (
+            "❌ <b>На балансе нет доступных сканов.</b>\n\n"
+            f"Подпишись на наш канал (+{CHANNEL_SUB_BONUS} бесплатный скан), "
+            f"пригласи друга (+{REFERRAL_BONUS} скан) или выбери тариф:"
+        )
+    else:
+        msg = (
+            "❌ <b>Бесплатные сканы исчерпаны.</b>\n\n"
+            f"Пригласи друга по ссылке (+{REFERRAL_BONUS} скан) или выбери тариф:"
+        )
+    bot.send_message(chat_id, msg, parse_mode="HTML", reply_markup=markup)
+
+
+def _send_pro_daily_limit_prompt(chat_id, daily_limit):
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("⚡ Докупить пакет сканов", callback_data="buy_menu"))
+    markup.add(InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
+    bot.send_message(
+        chat_id,
+        f"⏳ <b>Дневной лимит PRO исчерпан ({daily_limit}/{daily_limit}).</b>\n"
+        "Лимит обновится завтра в 00:00, либо можно докупить пакет дополнительных сканов:",
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
+
+
+def process_adult_photo(message, status_msg=None):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    free_limit, pro_tier, _, _ = get_user_access(user_id)
+    admin_user = is_admin(user_id)
+    daily_limit = get_pro_daily_limit_for_tier(pro_tier)
+
+    if not admin_user:
+        if pro_tier > 0:
+            if get_pro_remaining_today(user_id, pro_tier) <= 0 and free_limit <= 0:
+                delete_status_safe(chat_id, status_msg)
+                _send_pro_daily_limit_prompt(chat_id, daily_limit)
+                return
+        elif free_limit <= 0:
+            delete_status_safe(chat_id, status_msg)
+            _send_no_scans_prompt(chat_id, user_id=user_id)
+            return
+
+    try:
+        if not status_msg:
+            status_msg = send_status_safe(message, "⚡ Сканю пропорции лица...")
+        processed_bytes = download_and_process_photo(message)
+    except ValueError as val_err:
+        delete_status_safe(chat_id, status_msg)
+        bot.send_message(chat_id, f"⚠️ {val_err}")
+        return
+    except Exception as e:
+        delete_status_safe(chat_id, status_msg)
+        log_error(f"Ошибка скачивания фото: {e}")
+        bot.send_message(chat_id, "⏳ Не удалось скачать фото. Попробуй ещё раз.")
+        return
+
+    photo_hash = hashlib.sha256(CACHE_VERSION.encode("utf-8") + processed_bytes).hexdigest()[:32]
+    cached = cache_get(photo_hash)
+    if cached:
+        scores_text, full_text, card_bytes, card_file_id, _ = cached
+        delete_status_safe(chat_id, status_msg)
+        _send_report_card_or_text(
+            chat_id, card_bytes, scores_text, full_text, photo_hash,
+            is_profile=False, card_file_id=card_file_id,
+        )
+        return
+
+    consumed_mode = None
+    if not admin_user:
+        if pro_tier > 0:
+            if try_consume_pro_scan(user_id, daily_limit):
+                consumed_mode = "pro"
+            elif try_consume_extra_scan(user_id):
+                consumed_mode = "extra"
+            else:
+                delete_status_safe(chat_id, status_msg)
+                _send_pro_daily_limit_prompt(chat_id, daily_limit)
+                return
+        else:
+            if not try_consume_scan(user_id):
+                delete_status_safe(chat_id, status_msg)
+                _send_no_scans_prompt(chat_id, user_id=user_id)
+                return
+            consumed_mode = "free"
+
+    def refund_if_needed():
+        if consumed_mode in ("free", "extra"):
+            refund_scan(user_id)
+        elif consumed_mode == "pro":
+            refund_pro_scan(user_id)
+
+    scan_completed = False
+    try:
+        geom = analyze_face_geometry(processed_bytes)
+        prompt = build_adult_prompt(geom)
+        raw_response, api_errors = run_gemini_pipeline(processed_bytes, prompt)
+
+        if not raw_response:
+            refund_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, format_api_failure(api_errors), parse_mode="HTML")
+            return
+
+        scores_part, full_text = split_model_response(raw_response)
+        verdict = extract_verdict(scores_part)
+        if geom is None:
+            geom = extract_visual_geometry(scores_part)
+        scores_text, params_dict, final_score, category = normalize_adult_scores(scores_part)
+
+        if not scores_text:
+            refund_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, "🤔 Не удалось распознать лицо. Пришли чёткое фото анфас при хорошем свете.")
+            return
+
+        full_combined = _format_full_breakdown(full_text, geom=geom)
+        card_bytes = None
+        try:
+            card_bytes = render_front_report_card(
+                processed_bytes, params_dict or {}, final_score, category, verdict, geom,
+                bot_username=get_bot_username(),
+            )
+        except Exception as card_err:
+            log_error(f"Ошибка рендера карточки: {card_err}")
+
+        if consumed_mode == "free":
+            rem_limit, _, _, _ = get_user_access(user_id)
+            limit_info = (
+                "\n<i>Сканы закончились — пригласи друга (/ref) или пополни баланс (/buy).</i>"
+                if rem_limit == 0
+                else f"\n<i>Осталось сканов: {rem_limit}</i>"
+            )
+        elif consumed_mode == "extra":
+            rem_limit, _, _, _ = get_user_access(user_id)
+            limit_info = f"\n<i>Списан доп. скан из пакета (осталось доп.: {rem_limit})</i>"
+        elif consumed_mode == "pro":
+            pro_left = get_pro_remaining_today(user_id, pro_tier)
+            limit_info = f"\n<i>PRO-сканов на сегодня: {pro_left}/{daily_limit}</i>"
+        else:
+            limit_info = ""
+
+        delta_val = preview_score_delta(user_id, final_score)
+        delta_line = format_score_delta(delta_val)
+
+        delete_status_safe(chat_id, status_msg)
+        sent_file_id = _send_report_card_or_text(
+            chat_id, card_bytes, scores_text, full_combined, photo_hash,
+            verdict=verdict, limit_info=limit_info, delta_line=delta_line, is_profile=False,
+        )
+        scan_completed = True
+        cache_put(photo_hash, scores_text, full_combined, card_image=card_bytes, card_file_id=sent_file_id)
+        record_user_scan_stats(user_id, score=final_score)
+
+    except Exception as e:
+        log_error(f"Ошибка в process_adult_photo: {e}")
+        if not scan_completed:
+            refund_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, "⏳ Произошёл технический сбой. Попробуй ещё раз.")
+    finally:
+        gc.collect()
+
+
+def process_profile_photo(message, status_msg=None):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    def _keep_profile_markup():
+        set_awaiting_profile(user_id)
+        m = InlineKeyboardMarkup()
+        m.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_profile"))
+        return m
+
+    free_limit, pro_tier, _, _ = get_user_access(user_id)
+    admin_user = is_admin(user_id)
+    daily_limit = get_pro_daily_limit_for_tier(pro_tier)
+
+    if not admin_user:
+        if pro_tier <= 0:
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, "👑 Анализ бокового профиля доступен только с активным PRO (/buy).")
+            return
+        if get_pro_remaining_today(user_id, pro_tier) <= 0 and free_limit <= 0:
+            delete_status_safe(chat_id, status_msg)
+            _send_pro_daily_limit_prompt(chat_id, daily_limit)
+            return
+
+    try:
+        if not status_msg:
+            status_msg = send_status_safe(message, "📐 Анализирую структуру бокового профиля...")
+        processed_bytes = download_and_process_photo(message)
+    except ValueError as val_err:
+        delete_status_safe(chat_id, status_msg)
+        bot.send_message(
+            chat_id,
+            f"⚠️ {val_err}\nРежим профиля активен — отправь другое фото сбоку или нажми «Отмена».",
+            reply_markup=_keep_profile_markup(),
+        )
+        return
+    except Exception as e:
+        delete_status_safe(chat_id, status_msg)
+        log_error(f"Ошибка скачивания фото профиля: {e}")
+        bot.send_message(chat_id, "⏳ Не удалось скачать фото. Попробуй ещё раз.", reply_markup=_keep_profile_markup())
+        return
+
+    photo_hash = "p" + hashlib.sha256(PROFILE_CACHE_VERSION.encode("utf-8") + processed_bytes).hexdigest()[:31]
+    cached = cache_get(photo_hash)
+    if cached:
+        scores_text, full_text, card_bytes, card_file_id, _ = cached
+        delete_status_safe(chat_id, status_msg)
+        _send_report_card_or_text(
+            chat_id, card_bytes, scores_text, full_text, photo_hash,
+            is_profile=True, card_file_id=card_file_id,
+        )
+        return
+
+    consumed_mode = None
+    if not admin_user:
+        if try_consume_pro_scan(user_id, daily_limit):
+            consumed_mode = "pro"
+        elif try_consume_extra_scan(user_id):
+            consumed_mode = "extra"
+        else:
+            delete_status_safe(chat_id, status_msg)
+            _send_pro_daily_limit_prompt(chat_id, daily_limit)
+            return
+
+    def refund_profile_if_needed():
+        if consumed_mode == "pro":
+            refund_pro_scan(user_id)
+        elif consumed_mode == "extra":
+            refund_scan(user_id)
+
+    scan_completed = False
+    try:
+        raw_response, api_errors = run_gemini_pipeline(processed_bytes, PROFILE_RATING_PROMPT)
+        if not raw_response:
+            refund_profile_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, format_api_failure(api_errors), parse_mode="HTML", reply_markup=_keep_profile_markup())
+            return
+
+        profile_data, full_text = parse_profile_response(raw_response)
+        if not profile_data:
+            refund_profile_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(
+                chat_id,
+                "🤔 Не удалось распознать боковой профиль. Пришли чёткое фото строго сбоку (90°), чтобы была видна линия челюсти.\n\n"
+                "<i>Режим профиля остаётся активным — отправь следующее фото или нажми «Отмена».</i>",
+                parse_mode="HTML",
+                reply_markup=_keep_profile_markup(),
+            )
+            return
+
+        card_bytes = None
+        try:
+            card_bytes = render_profile_report_card(processed_bytes, profile_data, bot_username=get_bot_username())
+        except Exception as card_err:
+            log_error(f"Ошибка рендера карточки профиля: {card_err}")
+
+        if consumed_mode == "pro":
+            limit_info = f"\n<i>PRO-сканов на сегодня: {get_pro_remaining_today(user_id, pro_tier)}/{daily_limit}</i>"
+        elif consumed_mode == "extra":
+            rem_limit, _, _, _ = get_user_access(user_id)
+            limit_info = f"\n<i>Списан доп. скан из пакета (осталось доп.: {rem_limit})</i>"
+        else:
+            limit_info = ""
+
+        delete_status_safe(chat_id, status_msg)
+        sent_file_id = _send_report_card_or_text(
+            chat_id, card_bytes, profile_data["summary_text"], full_text, photo_hash,
+            verdict=profile_data.get("verdict", ""), limit_info=limit_info, is_profile=True,
+        )
+        scan_completed = True
+        cache_put(photo_hash, profile_data["summary_text"], full_text, card_image=card_bytes, card_file_id=sent_file_id)
+        record_user_scan_stats(user_id, score=None)
+
+    except Exception as e:
+        log_error(f"Ошибка в process_profile_photo: {e}")
+        if not scan_completed:
+            refund_profile_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, "⏳ Произошёл технический сбой. Попробуй ещё раз.")
+    finally:
+        gc.collect()
+
+
+def scan_worker_loop():
+    while True:
+        _, _, scan_type, message, status_msg = _scan_queue.get()
+        user_id = message.from_user.id
+        try:
+            if scan_type == "profile":
+                process_profile_photo(message, status_msg=status_msg)
+            else:
+                process_adult_photo(message, status_msg=status_msg)
+        except Exception as e:
+            log_error(f"Ошибка в scan_worker_loop: {e}")
+        finally:
+            release_user(user_id)
+            _scan_queue.task_done()
+
+
+def start_scan_workers():
+    for i in range(SCAN_WORKERS):
+        threading.Thread(target=scan_worker_loop, name=f"scan-worker-{i + 1}", daemon=True).start()
+
+
+def handle_receipt_submission(message, plan_id):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    plan = PLANS.get(plan_id)
+    if not plan:
+        bot.send_message(chat_id, "⚠️ Тариф не найден. Открой /buy заново.")
+        return
+
+    ok, err_msg = check_plan_allowed(user_id, plan)
+    if not ok:
+        bot.send_message(chat_id, f"⚠️ {err_msg}")
+        return
+
+    existing_req = get_pending_payment_request_id(user_id)
+    if existing_req:
+        bot.reply_to(
+            message,
+            f"⏳ У тебя уже есть нерассмотренная заявка <b>#{existing_req}</b>.\n"
+            "Дождись проверки администратором или напиши в /paysupport.",
+            parse_mode="HTML",
+        )
+        return
+
+    pricing = get_plan_pricing(plan_id, user_id=user_id)
+    req_id = create_payment_request(
+        user_id,
+        plan_id,
+        promo_code=pricing["promo_code"],
+        rub_amount=pricing["rub"],
+    )
+    username = f"@{message.from_user.username}" if message.from_user.username else "без юзернейма"
+    full_name = html.escape(message.from_user.first_name or "Пользователь")
+    promo_note = (
+        f"\nПромокод: <code>{html.escape(pricing['promo_code'])}</code> (-{pricing['discount_pct']}%)"
+        if pricing["promo_code"]
+        else ""
+    )
+
+    caption = (
+        f"💳 <b>Чек по заявке #{req_id}</b>\n\n"
+        f"Юзер: {full_name} ({html.escape(username)})\n"
+        f"ID: <code>{user_id}</code>\n"
+        f"Тариф: <b>{html.escape(plan['title'])}</b> ({pricing['rub']} ₽){promo_note}"
+    )
+
+    admin_markup = InlineKeyboardMarkup()
+    admin_markup.add(
+        InlineKeyboardButton("✅ Выдать доступ", callback_data=f"payok_{req_id}"),
+        InlineKeyboardButton("❌ Отклонить", callback_data=f"payno_{req_id}"),
+    )
+
+    sent_any = False
+    for admin_id in ADMIN_IDS:
+        try:
+            if message.photo:
+                bot.send_photo(admin_id, message.photo[-1].file_id, caption=caption, parse_mode="HTML", reply_markup=admin_markup)
+            elif message.document:
+                bot.send_document(admin_id, message.document.file_id, caption=caption, parse_mode="HTML", reply_markup=admin_markup)
+            sent_any = True
+        except Exception as e:
+            log_error(f"Не удалось отправить чек админу {admin_id}: {e}")
+
+    if sent_any:
+        bot.reply_to(
+            message,
+            f"✅ <b>Чек по заявке #{req_id} отправлен на проверку!</b>\n"
+            f"Тариф: <b>{html.escape(plan['title'])}</b>\n"
+            "После подтверждения доступ активируется автоматически.",
+            parse_mode="HTML",
+        )
+    else:
+        bot.reply_to(message, "⚠️ Не удалось отправить чек администратору. Нажми /paysupport.")
+
+
+@bot.message_handler(content_types=["photo", "document"])
+def handle_photo(message):
+    user_id = message.from_user.id
+    touch_user(message.from_user)
+    if is_user_banned(user_id):
+        bot.send_message(message.chat.id, "⛔ Доступ к боту ограничен.")
+        return
+
+    if is_admin(user_id) and _prepare_broadcast_preview(message):
+        return
+
+    if _is_duplicate_media_group(user_id, getattr(message, "media_group_id", None)):
+        return
+
+    if not check_rate_limit(user_id, "media", min_interval=2.5, max_per_min=10):
+        bot.reply_to(message, "⏳ Слишком частые запросы. Подожди пару секунд.")
+        return
+
+    pending_plan_id, receipt_expired = pop_awaiting_receipt(user_id)
+    if receipt_expired:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("💎 Открыть тарифы", callback_data="buy_menu"))
+        bot.send_message(
+            message.chat.id,
+            "⏳ <b>Время ожидания чека истекло (30 мин).</b>\n"
+            "Чтобы отправить чек, выбери тариф заново через меню ниже — фото не отправлено на скан.",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return
+
+    if pending_plan_id:
+        if message.content_type == "document" and not is_receipt_document(message):
+            set_awaiting_receipt(user_id, pending_plan_id)
+            bot.send_message(message.chat.id, "⚠️ Пришли скриншот чека (фото или PDF-файл).")
+            return
+        handle_receipt_submission(message, pending_plan_id)
+        return
+
+    is_profile_mode, profile_expired = pop_awaiting_profile(user_id)
+    if profile_expired:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("📐 Включить режим профиля", callback_data="profile_scan"))
+        bot.send_message(
+            message.chat.id,
+            "⏳ <b>Режим анализа бокового профиля истёк (30 мин).</b>\n"
+            "Нажми кнопку ниже и отправь фото заново, чтобы оно не пошло как скан анфас.",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return
+
+    if message.content_type == "document" and not is_image_document(message):
+        if is_profile_mode:
+            set_awaiting_profile(user_id)
+        bot.send_message(message.chat.id, "Пришли фото или изображение (JPG/PNG/WEBP).")
+        return
+
+    if not acquire_user(user_id):
+        if is_profile_mode:
+            set_awaiting_profile(user_id)
+        bot.send_message(message.chat.id, "⏳ Предыдущее фото ещё обрабатывается — подожди пару секунд.")
+        return
+
+    try:
+        _, pro_tier, _, is_adult = get_user_access(user_id)
+        if not is_adult and not is_admin(user_id):
+            release_user(user_id)
+            if is_profile_mode:
+                set_awaiting_profile(user_id)
+            send_adult_confirm(message.chat.id)
+            return
+
+        if not is_admin(user_id) and pro_tier <= 0 and _scan_queue.qsize() >= MAX_SCAN_QUEUE_SIZE:
+            release_user(user_id)
+            if is_profile_mode:
+                set_awaiting_profile(user_id)
+            bot.send_message(message.chat.id, "⏳ Очередь переполнена. Попробуй отправить фото через минуту.")
+            return
+
+        scan_type = "profile" if is_profile_mode else "front"
+        front_label = "Сканю пропорции по 468 точкам" if is_mediapipe_available() else "Сканю пропорции лица"
+
+        if is_admin(user_id) or pro_tier >= 2:
+            priority = 0
+            status_text = "📐 Анализирую боковой профиль (топ-приоритет)..." if is_profile_mode else f"⚡ {front_label} (топ-приоритет)..."
+        elif pro_tier == 1:
+            priority = 1
+            status_text = "📐 Анализирую боковой профиль (PRO-приоритет)..." if is_profile_mode else f"⚡ {front_label} (PRO-приоритет)..."
+        else:
+            priority = 2
+            status_text = "⏳ Фото добавлено в очередь..." if _scan_queue.qsize() >= SCAN_WORKERS else f"⚡ {front_label}..."
+
+        status_msg = send_status_safe(message, status_text)
+        _scan_queue.put((priority, next(_scan_seq), scan_type, message, status_msg))
+    except Exception as e:
+        release_user(user_id)
+        if is_profile_mode:
+            set_awaiting_profile(user_id)
+        log_error(f"Ошибка постановки фото в очередь: {e}")
+        bot.send_message(message.chat.id, "⏳ Произошла ошибка при обработке фото. Попробуй ещё раз.")
+
+
+def check_plan_allowed(user_id, plan):
+    if plan["type"] in ("pro30", "pro_life"):
+        _, pro_tier, _, _ = get_user_access(user_id)
+        if pro_tier >= 2:
+            return False, "У тебя уже активен PRO Навсегда!"
+    return True, None
+
+
+@bot.pre_checkout_query_handler(func=lambda query: True)
+def handle_pre_checkout(pre_checkout_query):
+    user_id = pre_checkout_query.from_user.id
+    if is_user_banned(user_id):
+        bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Доступ ограничен.")
+        return
+
+    payload = pre_checkout_query.invoice_payload or ""
+    parts = payload.split(":")
+    if len(parts) in (3, 4) and parts[0] == "plan" and parts[1] in PLANS and parts[2] == str(user_id):
+        plan_id = parts[1]
+        plan = PLANS[plan_id]
+        promo_code = parts[3].strip().upper() if len(parts) == 4 else ""
+
+        if promo_code:
+            pct = validate_discount_promo_for_user(user_id, promo_code)
+            if pct <= 0:
+                bot.answer_pre_checkout_query(
+                    pre_checkout_query.id,
+                    ok=False,
+                    error_message="Промокод истёк, исчерпан или уже привязан к заявке. Открой /buy заново.",
+                )
+                return
+            expected_stars = calc_discounted_price(plan["stars"], pct)
+        else:
+            expected_stars = plan["stars"]
+
+        if pre_checkout_query.currency != "XTR" or pre_checkout_query.total_amount != expected_stars:
+            bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Сумма платежа не совпадает.")
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message=err_msg or "Тариф недоступен.")
+            return
+        bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+    else:
+        bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Тариф не найден.")
+
+
+@bot.message_handler(content_types=["successful_payment"])
+def handle_successful_payment(message):
+    sp = message.successful_payment
+    user_id = message.from_user.id
+    parts = (sp.invoice_payload or "").split(":")
+    if len(parts) not in (3, 4) or parts[0] != "plan" or parts[1] not in PLANS or parts[2] != str(user_id):
+        log_error(f"Некорректный successful_payment payload от {user_id}: {sp.invoice_payload}")
+        return
+
+    plan_id = parts[1]
+    plan = PLANS[plan_id]
+    promo_code = parts[3].strip().upper() if len(parts) == 4 else ""
+
+    if promo_code:
+        pct = get_promo_discount_value_raw(promo_code)
+        expected_stars = calc_discounted_price(plan["stars"], pct) if pct > 0 else -1
+    else:
+        expected_stars = plan["stars"]
+
+    if sp.currency != "XTR" or sp.total_amount != expected_stars:
+        log_error(
+            f"Несовпадение суммы Stars от {user_id}: {sp.total_amount} {sp.currency} != {expected_stars} XTR"
+        )
+        return
+
+    if not record_stars_payment(sp.telegram_payment_charge_id, user_id, plan_id, sp.total_amount):
+        return
+
+    if promo_code:
+        consume_discount_promo(user_id, promo_code)
+
+    apply_plan_to_user(user_id, plan_id)
+    bot.send_message(
+        message.chat.id,
+        f"✅ <b>Оплата прошла успешно!</b>\nАктивировано: <b>{html.escape(plan['title'])}</b>.",
+        parse_mode="HTML",
+    )
+
+    username = f"@{message.from_user.username}" if message.from_user.username else "без юзернейма"
+    promo_str = f" (промокод {html.escape(promo_code)})" if promo_code else ""
+    for admin_id in ADMIN_IDS:
+        try:
+            bot.send_message(
+                admin_id,
+                f"⭐ <b>Оплата Telegram Stars</b>\n"
+                f"Юзер: <code>{user_id}</code> ({html.escape(username)})\n"
+                f"Тариф: {html.escape(plan['title'])} — <b>{sp.total_amount} ⭐</b>{promo_str}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    if not call.message:
+        safe_answer(call.id)
+        return
+
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
+    is_text_msg = call.message.content_type == "text"
+    edit_id = msg_id if is_text_msg else None
+
+    touch_user(call.from_user)
+    if is_user_banned(user_id):
+        safe_answer(call.id, "Доступ ограничен.", show_alert=True)
+        return
+
+    if not check_rate_limit(user_id, "cb", min_interval=0.4, max_per_min=35):
+        safe_answer(call.id, "Не так быстро 🙂")
+        return
+
+    data = call.data or ""
+
+    if data == "confirm_18":
+        set_user_adult(user_id)
+        safe_answer(call.id, "Возраст подтверждён")
+        try:
+            bot.edit_message_text("✅ Доступ открыт. Отправь фото лица анфас для анализа.", chat_id, msg_id)
+        except Exception:
+            bot.send_message(chat_id, "✅ Доступ открыт. Отправь фото лица анфас для анализа.")
+
+    elif data == "main_menu":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_main_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "main_menu_new":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_main_menu_view(user_id)
+        bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+
+    elif data == "psl_scale":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_psl_scale_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "psl_scale_new":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_psl_scale_view()
+        bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+
+    elif data == "scan_front_tip":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text = (
+            "<b>📸 Анализ лица анфас</b>\n\n"
+            "<blockquote>• Смотри прямо в камеру без наклона головы\n"
+            "• Ровный фронтальный свет, без жёстких теней\n"
+            "• Нейтральное выражение лица, без фильтров и очков</blockquote>\n\n"
+            "Просто отправь фото прямо сюда в чат."
+        )
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("📖 Шкала PSL", callback_data="psl_scale"))
+        markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "my_profile":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_profile_cabinet_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "buy_menu":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_buy_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "enter_promo":
+        clear_pending_modes(user_id)
+        set_awaiting_promo(user_id)
+        safe_answer(call.id, "Введи промокод")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_promo"))
+        edit_or_send(
+            chat_id,
+            "🎁 <b>Активация промокода</b>\n\n"
+            "Отправь промокод следующим сообщением в чат (например: <code>ADONIS</code>).",
+            reply_markup=markup,
+            message_id=edit_id,
+        )
+
+    elif data == "cancel_promo":
+        clear_awaiting_promo(user_id)
+        safe_answer(call.id, "Отменено")
+        text, markup = build_main_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "channel_bonus":
+        clear_pending_modes(user_id)
+        if not is_channel_bonus_enabled():
+            safe_answer(call.id, "Бонус пока недоступен.", show_alert=True)
+            return
+        if is_channel_bonus_claimed(user_id):
+            safe_answer(call.id, "Ты уже получил бонус за подписку!", show_alert=True)
+            return
+        safe_answer(call.id)
+        text, markup = build_channel_bonus_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "check_sub":
+        if not is_channel_bonus_enabled():
+            safe_answer(call.id, "Канал не настроен.", show_alert=True)
+            return
+        if is_channel_bonus_claimed(user_id):
+            safe_answer(call.id, "Бонус уже получен!", show_alert=True)
+            return
+        try:
+            member = bot.get_chat_member(get_channel_chat_id(), user_id)
+            is_sub = getattr(member, "status", "") in ("member", "administrator", "creator")
+        except Exception as e:
+            log_error(f"Ошибка проверки подписки на {CHANNEL_ID}: {e}")
+            safe_answer(call.id, "Не удалось проверить подписку. Попробуй позже.", show_alert=True)
+            return
+
+        if not is_sub:
+            safe_answer(call.id, "Подписка не найдена. Сначала подпишись на канал!", show_alert=True)
+            return
+
+        if claim_channel_bonus(user_id):
+            safe_answer(call.id, f"+{CHANNEL_SUB_BONUS} скан начислен!", show_alert=True)
+            text, markup = build_main_menu_view(user_id)
+            edit_or_send(
+                chat_id,
+                f"🎉 <b>Спасибо за подписку!</b> Начислено <b>+{CHANNEL_SUB_BONUS} бесплатный скан</b>.\n\n{text}",
+                reply_markup=markup,
+                message_id=edit_id,
+            )
+        else:
+            safe_answer(call.id, "Бонус уже был выдан ранее.", show_alert=True)
+
+    elif data == "get_ref":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_ref_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "support_menu":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_support_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "profile_scan":
+        clear_pending_modes(user_id)
+        _, pro_tier, _, _ = get_user_access(user_id)
+        if pro_tier <= 0 and not is_admin(user_id):
+            safe_answer(call.id, "Доступно в PRO")
+            markup = InlineKeyboardMarkup(row_width=1)
+            markup.add(InlineKeyboardButton("👑 Подключить PRO", callback_data="buy_menu"))
+            markup.add(InlineKeyboardButton("🤝 Получить PRO за друзей", callback_data="get_ref"))
+            markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+            text = (
+                "<b>📐 Анализ бокового профиля (PRO)</b>\n\n"
+                "<blockquote>Структурная карточка по 6 ключевым параметрам:\n"
+                "• Проекция подбородка и максиллы\n"
+                "• Чёткость угла челюсти\n"
+                "• Шейно-подбородочный угол\n"
+                "• Профиль носа и общая гармония</blockquote>\n\n"
+                "Открывается на тарифах <b>PRO 30 дней</b> и <b>PRO Навсегда</b>."
+            )
+            edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+            return
+
+        set_awaiting_profile(user_id)
+        safe_answer(call.id, "Отправь фото в профиль")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_profile"))
+        text = (
+            "<b>📐 Режим анализа бокового профиля</b>\n\n"
+            "<blockquote>Отправь чёткое фото строго <b>сбоку (90°)</b> при хорошем свете, "
+            "чтобы была видна линия челюсти, подбородок и профиль носа.</blockquote>"
+        )
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "cancel_profile":
+        clear_awaiting_profile(user_id)
+        safe_answer(call.id, "Режим профиля отменён")
+        text, markup = build_main_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "cancel_pay":
+        clear_pending_modes(user_id)
+        safe_answer(call.id, "Оплата отменена")
+        text, markup = build_main_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data.startswith("plan_"):
+        clear_pending_modes(user_id)
+        plan_id = data[5:]
+        plan = PLANS.get(plan_id)
+        if not plan:
+            safe_answer(call.id, "Тариф не найден.", show_alert=True)
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            safe_answer(call.id, err_msg, show_alert=True)
+            return
+
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        safe_answer(call.id)
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton(f"⭐ Оплатить {pr['stars']} Stars (мгновенно)", callback_data=f"stars_{plan_id}"))
+        if PAYMENT_CARD:
+            markup.add(InlineKeyboardButton(f"💳 Перевод на карту (только РФ) — {pr['rub']} ₽", callback_data=f"card_{plan_id}"))
+        markup.add(InlineKeyboardButton("⬅️ К тарифам", callback_data="buy_menu"))
+
+        promo_info = (
+            f"\n🎁 Промокод <code>{html.escape(pr['promo_code'])}</code>: скидка <b>-{pr['discount_pct']}%</b> "
+            f"(<s>{pr['orig_stars']} ⭐</s> → <b>{pr['stars']} ⭐</b> | <s>{pr['orig_rub']} ₽</s> → <b>{pr['rub']} ₽</b>)"
+            if pr["promo_code"]
+            else ""
+        )
+        text = (
+            f"<b>{html.escape(plan['title'])}</b>\n\n"
+            f"<blockquote>{html.escape(plan['desc'])}{promo_info}</blockquote>\n\n"
+            "Выбери удобный способ оплаты:"
+        )
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data.startswith("stars_"):
+        clear_pending_modes(user_id)
+        plan_id = data[6:]
+        plan = PLANS.get(plan_id)
+        if not plan:
+            safe_answer(call.id, "Тариф не найден.", show_alert=True)
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            safe_answer(call.id, err_msg, show_alert=True)
+            return
+
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        inv_payload = (
+            f"plan:{plan_id}:{user_id}:{pr['promo_code']}"
+            if pr["promo_code"]
+            else f"plan:{plan_id}:{user_id}"
+        )
+        desc = (
+            f"{plan['desc']} (промокод {pr['promo_code']} -{pr['discount_pct']}%)"
+            if pr["promo_code"]
+            else plan["desc"]
+        )
+        safe_answer(call.id, "Открываю счёт...")
+        try:
+            bot.send_invoice(
+                chat_id=chat_id,
+                title=plan["title"],
+                description=desc,
+                invoice_payload=inv_payload,
+                provider_token="",
+                currency="XTR",
+                prices=[LabeledPrice(label=plan["title"], amount=pr["stars"])],
+            )
+        except Exception as e:
+            log_error(f"Ошибка выставления счёта Stars: {e}")
+            bot.send_message(chat_id, "⚠️ Не удалось создать счёт Stars. Попробуй позже или выбери карту.")
+
+    elif data.startswith("card_"):
+        clear_pending_modes(user_id)
+        plan_id = data[5:]
+        plan = PLANS.get(plan_id)
+        if not plan or not PAYMENT_CARD:
+            safe_answer(call.id, "Оплата картой временно недоступна.", show_alert=True)
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            safe_answer(call.id, err_msg, show_alert=True)
+            return
+
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        safe_answer(call.id)
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("✅ Я оплатил — отправить чек", callback_data=f"paid_{plan_id}"))
+        markup.add(InlineKeyboardButton("⬅️ К тарифам", callback_data="buy_menu"))
+
+        sum_str = (
+            f"<s>{pr['orig_rub']} ₽</s> <b>{pr['rub']} ₽</b> (промокод {html.escape(pr['promo_code'])} -{pr['discount_pct']}%)"
+            if pr["promo_code"]
+            else f"<b>{pr['rub']} ₽</b>"
+        )
+        text = (
+            f"<b>💳 Оплата картой (только РФ): {html.escape(plan['title'])}</b>\n\n"
+            f"<blockquote>Сумма: {sum_str}\n"
+            f"Банк: <b>{html.escape(PAYMENT_BANK)}</b>\n"
+            f"Карта: <code>{html.escape(PAYMENT_CARD)}</code></blockquote>\n\n"
+            "После перевода нажми кнопку ниже и отправь чек."
+        )
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data.startswith("paid_"):
+        plan_id = data[5:]
+        plan = PLANS.get(plan_id)
+        if not plan or not PAYMENT_CARD:
+            safe_answer(call.id, "Оплата картой временно недоступна.", show_alert=True)
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            safe_answer(call.id, err_msg, show_alert=True)
+            return
+        existing_req = get_pending_payment_request_id(user_id)
+        if existing_req:
+            safe_answer(call.id, f"Заявка #{existing_req} ещё на проверке.", show_alert=True)
+            return
+
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        set_awaiting_receipt(user_id, plan_id)
+        safe_answer(call.id, "Отправь скриншот или PDF-чек")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_pay"))
+        text = (
+            f"📸 <b>Отправь скриншот или PDF-чек</b> об оплате "
+            f"<b>{html.escape(plan['title'])}</b> ({pr['rub']} ₽) прямо сюда в чат."
+        )
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data.startswith("payok_") or data.startswith("payno_"):
+        if not is_admin(user_id):
+            safe_answer(call.id, "Нет прав.", show_alert=True)
+            return
+        is_approve = data.startswith("payok_")
+        try:
+            req_id = int(data.split("_", 1)[1])
+        except ValueError:
+            safe_answer(call.id, "Некорректная заявка.", show_alert=True)
+            return
+
+        resolved = resolve_payment_request(req_id, "approved" if is_approve else "rejected")
+        if not resolved:
+            safe_answer(call.id, "Заявка уже обработана.", show_alert=True)
+            return
+
+        target_id, plan_id, req_promo, _ = resolved
+        plan = PLANS.get(plan_id)
+
+        if is_approve and plan:
+            if req_promo:
+                consume_discount_promo(target_id, req_promo)
+            apply_plan_to_user(target_id, plan_id)
+            safe_answer(call.id, "Доступ выдан!")
+            status_suffix = "\n\n✅ <b>Доступ выдан</b>"
+            try:
+                bot.send_message(
+                    target_id,
+                    f"✅ <b>Оплата подтверждена!</b>\nАктивировано: <b>{html.escape(plan['title'])}</b>.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        else:
+            safe_answer(call.id, "Заявка отклонена.")
+            status_suffix = "\n\n❌ <b>Отклонено</b>"
+            try:
+                bot.send_message(target_id, f"❌ Заявка на оплату #{req_id} отклонена администратором.")
+            except Exception:
+                pass
+
+        try:
+            if call.message.content_type in ("photo", "document"):
+                base_cap = call.message.html_caption or html.escape(call.message.caption or "")
+                bot.edit_message_caption(base_cap + status_suffix, chat_id, msg_id, parse_mode="HTML", reply_markup=None)
+            else:
+                base_txt = call.message.html_text or html.escape(call.message.text or "")
+                bot.edit_message_text(base_txt + status_suffix, chat_id, msg_id, parse_mode="HTML", reply_markup=None)
+        except Exception:
+            try:
+                bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
+            except Exception:
+                pass
+
+    elif data.startswith("setmodel_"):
+        if not is_admin(user_id):
+            safe_answer(call.id, "Нет прав.", show_alert=True)
+            return
+        clear_awaiting_model(user_id)
+        chosen = data[9:].strip()
+        parsed = parse_models_input(chosen)
+        if not parsed:
+            safe_answer(call.id, "Некорректная модель.", show_alert=True)
+            return
+        set_active_models(parsed)
+        safe_answer(call.id, f"Установлена {parsed[0]}")
+        text, markup = build_model_manager_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "model_custom":
+        if not is_admin(user_id):
+            safe_answer(call.id, "Нет прав.", show_alert=True)
+            return
+        clear_pending_modes(user_id)
+        set_awaiting_model(user_id)
+        safe_answer(call.id, "Отправь название модели")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="model_cancel"))
+        edit_or_send(
+            chat_id,
+            "✏️ <b>Ввод своей модели Gemini</b>\n\n"
+            "Отправь следующим сообщением точное название модели (например: "
+            "<code>gemini-3.5-flash-lite</code>) или несколько через запятую.",
+            reply_markup=markup,
+            message_id=edit_id,
+        )
+
+    elif data == "model_cancel":
+        if not is_admin(user_id):
+            safe_answer(call.id)
+            return
+        clear_awaiting_model(user_id)
+        safe_answer(call.id, "Отменено")
+        text, markup = build_model_manager_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "model_reset_cd":
+        if not is_admin(user_id):
+            safe_answer(call.id, "Нет прав.", show_alert=True)
+            return
+        reset_model_cooldowns()
+        safe_answer(call.id, "Паузы 404/429 сброшены!", show_alert=True)
+
+    elif data == "bc_cancel":
+        if not is_admin(user_id):
+            safe_answer(call.id)
+            return
+        clear_broadcast_state(user_id)
+        safe_answer(call.id, "Рассылка отменена")
+        try:
+            bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
+        except Exception:
+            pass
+        bot.send_message(chat_id, "❌ Рассылка отменена.")
+
+    elif data == "bc_send":
+        if not is_admin(user_id):
+            safe_answer(call.id)
+            return
+        with _broadcast_lock:
+            payload = _broadcast_state.pop(user_id, None)
+        if not payload or payload.get("step") != "ready":
+            safe_answer(call.id, "Нет активного черновика.", show_alert=True)
+            return
+        safe_answer(call.id, "Запускаю рассылку...")
+        try:
+            bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
+        except Exception:
+            pass
+        bot.send_message(chat_id, "🚀 Рассылка запущена в фоне...")
+        threading.Thread(target=_run_broadcast_worker, args=(chat_id, payload), daemon=True).start()
+
+    elif data.startswith("full_"):
+        photo_hash = data[5:]
+        if not re.fullmatch(r"p?[0-9a-f]{31,32}", photo_hash):
+            safe_answer(call.id, "Некорректный идентификатор отчёта.", show_alert=True)
+            return
+        cached = cache_get(photo_hash)
+        if cached and cached[1]:
+            safe_answer(call.id, "Загружаю разбор...")
+            title = "📐 Разбор бокового профиля" if photo_hash.startswith("p") else "💬 Подробный разбор"
+            send_long_html(chat_id, title, cached[1])
+        else:
+            safe_answer(call.id, "Разбор устарел, отправь фото заново.", show_alert=True)
+
+    elif data.startswith("growth_"):
+        photo_hash = data[7:]
+        if not re.fullmatch(r"[0-9a-f]{32}", photo_hash):
+            safe_answer(call.id, "Некорректный идентификатор отчёта.", show_alert=True)
+            return
+
+        _, pro_tier, _, _ = get_user_access(user_id)
+        if pro_tier <= 0 and not is_admin(user_id):
+            safe_answer(call.id, "Доступно в PRO")
+            markup = InlineKeyboardMarkup(row_width=1)
+            markup.add(InlineKeyboardButton("👑 Подключить PRO", callback_data="buy_menu"))
+            markup.add(InlineKeyboardButton("🤝 Получить PRO за друзей", callback_data="get_ref"))
+            bot.send_message(
+                chat_id,
+                "<b>📈 Персональный план роста (PRO)</b>\n\n"
+                "<blockquote>По результатам твоего скана бот составит пошаговый план:\n"
+                "• Топ-3 зоны роста с максимальным эффектом\n"
+                "• Подбор стрижки и щетины строго под твою форму лица\n"
+                "• Чек-лист по коже, бровям, отёчности и грумингу на 30 дней</blockquote>\n\n"
+                "Открывается на тарифах <b>PRO</b> или бесплатно за 3 приглашённых друзей.",
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+            return
+
+        cached = cache_get(photo_hash)
+        if not cached:
+            safe_answer(call.id, "Отчёт устарел, отправь фото заново.", show_alert=True)
+            return
+
+        scores_text, full_text, _, _, growth_plan = cached
+        if growth_plan:
+            safe_answer(call.id, "Загружаю план роста...")
+            send_long_html(chat_id, "📈 Персональный план роста (PRO)", growth_plan)
+            return
+
+        busy_key = (user_id, photo_hash)
+        with _growth_busy_lock:
+            if busy_key in _growth_busy:
+                safe_answer(call.id, "План уже составляется, подожди пару секунд...")
+                return
+            _growth_busy.add(busy_key)
+
+        safe_answer(call.id, "Составляю персональный план...")
+        status_msg = bot.send_message(chat_id, "📈 Составляю персональный план роста по твоим метрикам...")
+        threading.Thread(
+            target=_run_growth_plan_worker,
+            args=(chat_id, user_id, photo_hash, scores_text, full_text, status_msg),
+            daemon=True,
+        ).start()
+
+    else:
+        safe_answer(call.id)
+
+
+@bot.message_handler(content_types=["text"])
+def handle_fallback_text(message):
+    user_id = message.from_user.id
+    touch_user(message.from_user)
+    if is_user_banned(user_id):
+        return
+
+    if is_awaiting_promo(user_id):
+        clear_awaiting_promo(user_id)
+        ok, ptype, msg_text = activate_promocode_for_user(user_id, message.text)
+        markup = InlineKeyboardMarkup(row_width=1)
+        if ok and ptype == "discount":
+            markup.add(InlineKeyboardButton("💎 Перейти к тарифам со скидкой", callback_data="buy_menu"))
+        elif not ok:
+            markup.add(InlineKeyboardButton("🔁 Попробовать другой код", callback_data="enter_promo"))
+        markup.add(InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
+        bot.reply_to(message, msg_text, parse_mode="HTML", reply_markup=markup)
+        return
+
+    if is_awaiting_receipt(user_id):
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_pay"))
+        bot.reply_to(
+            message,
+            "📸 Жду <b>скриншот или PDF-чек</b> об оплате. Пришли его фото/файлом или нажми «Отмена».",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+    elif is_awaiting_profile(user_id):
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_profile"))
+        bot.reply_to(
+            message,
+            "📐 Сейчас активен режим <b>бокового профиля</b>. Пришли фото сбоку (90°) или нажми «Отмена».",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+
+
+if __name__ == "__main__":
+    init_db()
+    ensure_user_columns()
+    load_active_models_from_db()
+    setup_bot_commands()
+    start_scan_workers()
+    is_mediapipe_available()
+    uname = get_bot_username()
+    print(f"🚀 Adonis PSL Bot (@{uname or 'unknown'}) запущен!")
+
+    while True:
+        try:
+            bot.infinity_polling(
+                timeout=30,
+                long_polling_timeout=25,
+                skip_pending=True,
+            )
+        except KeyboardInterrupt:
+            print("🛑 Бот остановлен вручную.")
+            break
+        except Exception as e:
+            log_error(f"Сбой polling, перезапуск через 5 сек: {e}")
+            time.sleep(5) _media_group_lock = threading.Lock()
+_seen_media_groups = {}
+
+
+def _is_duplicate_media_group(user_id, media_group_id):
+    if not media_group_id:
+        return False
+    now = time.time()
+    key = (user_id, str(media_group_id))
+    with _media_group_lock:
+        if len(_seen_media_groups) > 500:
+            cutoff = now - 60.0
+            stale = [k for k, ts in _seen_media_groups.items() if ts < cutoff]
+            for k in stale:
+                del _seen_media_groups[k]
+        if key in _seen_media_groups and (now - _seen_media_groups[key]) < 30.0:
+            return True
+        _seen_media_groups[key] = now
+        return False
+
+
+def send_status_safe(message, text):
+    try:
+        return bot.reply_to(message, text)
+    except Exception:
+        try:
+            return bot.send_message(message.chat.id, text)
+        except Exception as e:
+            log_error(f"Не удалось отправить статус: {e}")
+            return None
+
+
+def delete_status_safe(chat_id, status_msg):
+    if not status_msg:
+        return
+    try:
+        bot.delete_message(chat_id, status_msg.message_id)
+    except Exception:
+        pass
+
+
+def safe_answer(call_id, text=None, show_alert=False):
+    try:
+        bot.answer_callback_query(call_id, text, show_alert=show_alert)
+    except Exception as e:
+        log_error(f"answer_callback_query: {e}")
+
+
+def edit_or_send(chat_id, text, reply_markup=None, message_id=None, parse_mode="HTML"):
+    if message_id:
+        try:
+            bot.edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=message_id,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+            return
+        except Exception as e:
+            if "message is not modified" in str(e).lower():
+                return
+    bot.send_message(
+        chat_id,
+        text,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True,
+    )
+
+
+def send_long_html(chat_id, title, text, limit=3500):
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if current and len(current) + len(line) + 1 > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
+
+    for i, chunk in enumerate(chunks):
+        header = f"<b>{html.escape(title)}</b>\n\n" if i == 0 else ""
+        try:
+            bot.send_message(chat_id, header + html.escape(chunk), parse_mode="HTML")
+        except Exception:
+            plain = f"{title}\n\n{chunk}" if i == 0 else chunk
+            bot.send_message(chat_id, plain, parse_mode=None)
+
+
+def is_image_document(message):
+    doc = getattr(message, "document", None)
+    if not doc:
+        return False
+    mime = (doc.mime_type or "").lower()
+    fname = (doc.file_name or "").lower()
+    return mime.startswith("image/") or fname.endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp"))
+
+
+def is_receipt_document(message):
+    if is_image_document(message):
+        return True
+    doc = getattr(message, "document", None)
+    if not doc:
+        return False
+    mime = (doc.mime_type or "").lower()
+    fname = (doc.file_name or "").lower()
+    return mime == "application/pdf" or fname.endswith(".pdf")
+
+
+def download_and_process_photo(message):
+    if message.photo:
+        file_obj = message.photo[-1]
+    elif message.document:
+        file_obj = message.document
+    else:
+        raise ValueError("Пришли фото лица.")
+
+    if (getattr(file_obj, "file_size", 0) or 0) > MAX_IMAGE_FILE_SIZE:
+        raise ValueError("Файл слишком большой (максимум 15 МБ).")
+
+    file_info = bot.get_file(file_obj.file_id)
+    if (file_info.file_size or 0) > MAX_IMAGE_FILE_SIZE:
+        raise ValueError("Файл слишком большой (максимум 15 МБ).")
+
+    raw_bytes = bot.download_file(file_info.file_path)
+    try:
+        with io.BytesIO(raw_bytes) as in_buf, Image.open(in_buf) as img:
+            img = ImageOps.exif_transpose(img)
+            if img.width < 64 or img.height < 64:
+                raise ValueError("Изображение слишком маленькое. Пришли чёткое фото лица.")
+            rgb = img.convert("RGB")
+            rgb.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+            with io.BytesIO() as out_buf:
+                rgb.save(out_buf, format="JPEG", quality=90, optimize=True)
+                return out_buf.getvalue()
+    except ValueError:
+        raise
+    except Image.DecompressionBombError:
+        raise ValueError("Изображение имеет слишком высокое разрешение.")
+    except Exception:
+        raise ValueError("Не удалось прочитать изображение. Пришли обычный JPG или PNG.")
+
+
+def setup_bot_commands():
+    default_commands = [
+        BotCommand("start", "Главное меню"),
+        BotCommand("buy", "Тарифы и сканы"),
+        BotCommand("ref", "Пригласить друга (+1 скан)"),
+        BotCommand("scale", "Шкала PSL 1.0–8.0"),
+        BotCommand("paysupport", "Поддержка"),
+    ]
+    admin_commands = default_commands + [
+        BotCommand("admin", "Шпаргалка по админке"),
+        BotCommand("model", "Сменить модель Gemini"),
+    ]
+    try:
+        bot.set_my_commands(default_commands, scope=BotCommandScopeDefault())
+        for admin_id in ADMIN_IDS:
+            bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
+    except Exception as e:
+        log_error(f"Не удалось выставить меню команд: {e}")
+
+
+def format_user_status_short(user_id):
+    free_limit, pro_tier, pro_until, _ = get_user_access(user_id)
+    if is_admin(user_id):
+        return "👑 <b>Администратор</b> • без лимитов"
+    extra_str = f" (+{free_limit} доп.)" if free_limit > 0 else ""
+    if pro_tier >= 2:
+        left = get_pro_remaining_today(user_id, pro_tier)
+        return f"💎 <b>PRO Навсегда</b> • сегодня {left}/{PRO_LIFE_DAILY_LIMIT}{extra_str}"
+    if pro_tier == 1:
+        left = get_pro_remaining_today(user_id, pro_tier)
+        until_str = format_date_from_ts(pro_until) if pro_until > 0 else "—"
+        return f"👑 <b>PRO до {until_str}</b> • сегодня {left}/{PRO30_DAILY_LIMIT}{extra_str}"
+    return f"⚡ <b>Базовый</b> • доступно сканов: <b>{free_limit}</b>"
+
+
+def format_score_delta(delta):
+    if delta is None:
+        return ""
+    if delta > 0.05:
+        return f"📈 +{delta:.1f} к прошлому скану"
+    if delta < -0.05:
+        return f"📉 {delta:.1f} к прошлому скану"
+    return "➖ без изменений к прошлому скану"
+
+
+def preview_score_delta(user_id, new_score):
+    if new_score is None:
+        return None
+    _, best_score, _, _, _, _, last_score, _ = get_user_profile_stats(user_id)
+    ref_score = last_score if last_score > 0.0 else best_score
+    if ref_score <= 0.0:
+        return None
+    return round(float(new_score) - float(ref_score), 1)
+
+
+def build_main_menu_view(user_id):
+    free_limit, pro_tier, _, _ = get_user_access(user_id)
+    status_line = format_user_status_short(user_id)
+    scans_cnt, best_score, _, _, _, _, last_score, prev_score = get_user_profile_stats(user_id)
+    best_line = f" • Лучший балл: <b>{best_score:.1f}/8</b>" if best_score > 0 else ""
+    delta_line = ""
+    if last_score > 0 and prev_score > 0:
+        d_txt = format_score_delta(round(last_score - prev_score, 1))
+        if d_txt:
+            delta_line = f"\nПоследний скан: <b>{last_score:.1f}/8</b> ({d_txt})"
+
+    sub_hint = ""
+    if (
+        not is_admin(user_id)
+        and pro_tier == 0
+        and free_limit <= 0
+        and is_channel_bonus_enabled()
+        and not is_channel_bonus_claimed(user_id)
+    ):
+        sub_hint = (
+            f"\n\n🎁 <b>Получи +{CHANNEL_SUB_BONUS} бесплатный скан:</b> "
+            "подпишись на наш канал кнопкой ниже!"
+        )
+
+    text = (
+        "<b>ADONIS PSL • Биометрия лица</b>\n\n"
+        f"<blockquote>{status_line}\n"
+        f"Сканов выполнено: <b>{scans_cnt}</b>{best_line}{delta_line}</blockquote>\n\n"
+        "Просто отправь <b>фото анфас</b> при ровном свете — бот замерит пропорции "
+        f"и соберёт карточку-отчёт по шкале 1.0–8.0.{sub_hint}"
+    )
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("📸 Анализ анфас", callback_data="scan_front_tip"),
+        InlineKeyboardButton("📐 Профиль (PRO)", callback_data="profile_scan"),
+    )
+    markup.add(
+        InlineKeyboardButton("👤 Мой профиль", callback_data="my_profile"),
+        InlineKeyboardButton("💎 Тарифы и сканы", callback_data="buy_menu"),
+    )
+    markup.add(
+        InlineKeyboardButton("🤝 Пригласить друга", callback_data="get_ref"),
+        InlineKeyboardButton("📖 Шкала PSL", callback_data="psl_scale"),
+    )
+    if is_channel_bonus_enabled() and not is_channel_bonus_claimed(user_id):
+        markup.add(
+            InlineKeyboardButton(
+                f"📢 +{CHANNEL_SUB_BONUS} скан за подписку",
+                callback_data="channel_bonus",
+            ),
+            InlineKeyboardButton("🆘 Поддержка", callback_data="support_menu"),
+        )
+    else:
+        markup.add(InlineKeyboardButton("🆘 Поддержка", callback_data="support_menu"))
+    return text, markup
+
+
+def build_psl_scale_view():
+    text = (
+        "<b>📖 Шкала PSL (1.0–8.0)</b>\n\n"
+        "<blockquote>"
+        "• <b>1.0–2.4</b> — <b>Саб 3</b> <i>(нижние ~5%)</i>\n"
+        "• <b>2.5–2.9</b> — <b>Саб 5</b> <i>(ниже среднего)</i>\n"
+        "• <b>3.0–3.4</b> — <b>Лтн</b> <i>(нижняя граница нормы)</i>\n"
+        "• <b>3.5–3.9</b> — <b>Мтн</b> <i>(средняя норма, ~50-й процентиль)</i>\n"
+        "• <b>4.0–4.4</b> — <b>Мхтн</b> <i>(выше среднего)</i>\n"
+        "• <b>4.5–4.9</b> — <b>Хмтн</b> <i>(верхние ~20%)</i>\n"
+        "• <b>5.0–5.4</b> — <b>Хтн</b> <i>(верхние ~10%)</i>\n"
+        "• <b>5.5–6.4</b> — <b>Лоу чад лайт</b> <i>(модельный уровень, топ ~3%)</i>\n"
+        "• <b>6.5–6.9</b> — <b>Чад лайт</b> <i>(сильный модельный, топ ~1%)</i>\n"
+        "• <b>7.0–8.0</b> — <b>Чад</b> <i>(элитный мировой уровень, топ &lt;0.2%)</i>"
+        "</blockquote>\n\n"
+        "<b>📸 Как получить точный замер:</b>\n"
+        "• Основная камера на уровне глаз с расстояния ~1–1.5 м (без широкоугольных искажений)\n"
+        "• Ровный фронтальный дневной свет, нейтральное лицо, без фильтров и очков"
+    )
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("📸 Сделать скан", callback_data="scan_front_tip"),
+        InlineKeyboardButton("👤 Мой профиль", callback_data="my_profile"),
+    )
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def build_profile_cabinet_view(user_id):
+    status_line = format_user_status_short(user_id)
+    scans_cnt, best_score, ref_count, _, _, _, last_score, prev_score = get_user_profile_stats(user_id)
+    best_str = f"<b>{best_score:.1f}/8</b> ({category_by_score(best_score)})" if best_score > 0 else "ещё нет"
+
+    last_line = ""
+    if last_score > 0:
+        delta_txt = format_score_delta(round(last_score - prev_score, 1)) if prev_score > 0 else ""
+        delta_part = f" • {delta_txt}" if delta_txt else ""
+        last_line = f"\nПоследний скан: <b>{last_score:.1f}/8</b>{delta_part}"
+
+    promo_code, discount_pct = get_user_active_discount(user_id)
+    promo_line = (
+        f"\nАктивный промокод: <code>{html.escape(promo_code)}</code> (<b>-{discount_pct}%</b>)"
+        if promo_code
+        else ""
+    )
+
+    uname = get_bot_username()
+    ref_block = (
+        f"\n🔗 Реф-ссылка:\n<code>https://t.me/{uname}?start=ref_{user_id}</code>"
+        if uname
+        else ""
+    )
+
+    text = (
+        "<b>👤 Мой профиль</b>\n\n"
+        f"<blockquote>{status_line}\n"
+        f"ID: <code>{user_id}</code>\n"
+        f"Всего сканов: <b>{scans_cnt}</b>\n"
+        f"Лучший результат: {best_str}{last_line}\n"
+        f"Приглашено друзей: <b>{ref_count}</b>{promo_line}</blockquote>"
+        f"{ref_block}"
+    )
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("💎 Пополнить / PRO", callback_data="buy_menu"),
+        InlineKeyboardButton("🎁 Промокод", callback_data="enter_promo"),
+    )
+    markup.add(
+        InlineKeyboardButton("🤝 Рефералка", callback_data="get_ref"),
+        InlineKeyboardButton("📖 Шкала PSL", callback_data="psl_scale"),
+    )
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def build_buy_menu_view(user_id=None):
+    promo_code, discount_pct = get_user_active_discount(user_id) if user_id is not None else ("", 0)
+    promo_banner = (
+        f"🎁 <b>Активна скидка -{discount_pct}%</b> по промокоду <code>{html.escape(promo_code)}</code>!\n\n"
+        if promo_code
+        else ""
+    )
+
+    lines = []
+    for plan_id, plan in PLANS.items():
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        if pr["discount_pct"] > 0:
+            price_txt = (
+                f"<s>{pr['orig_stars']} ⭐</s> <b>{pr['stars']} ⭐</b> / "
+                f"<s>{pr['orig_rub']} ₽</s> <b>{pr['rub']} ₽</b>"
+            )
+        else:
+            price_txt = f"{pr['stars']} ⭐ / {pr['rub']} ₽"
+
+        if plan_id == "pack15":
+            lines.append(f"• <b>{html.escape(plan['title'])}</b> — {price_txt} <i>(выгоднее)</i>")
+        elif plan_id == "pro30":
+            lines.append(
+                f"• <b>{html.escape(plan['title'])}</b> — {price_txt}\n"
+                f"  <i>{PRO30_DAILY_LIMIT} сканов/день + профиль + план роста + приоритет</i>"
+            )
+        elif plan_id == "pro_life":
+            lines.append(
+                f"• <b>{html.escape(plan['title'])}</b> — {price_txt}\n"
+                f"  <i>{PRO_LIFE_DAILY_LIMIT} сканов/день + профиль + план роста + топ-приоритет</i>"
+            )
+        else:
+            lines.append(f"• <b>{html.escape(plan['title'])}</b> — {price_txt}")
+
+    text = (
+        "<b>💎 Тарифы и сканы</b>\n\n"
+        f"{promo_banner}"
+        "<blockquote>" + "\n".join(lines) + "</blockquote>\n\n"
+        "Оплата через <b>Telegram Stars</b> активируется мгновенно."
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    for plan_id, plan in PLANS.items():
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        disc_tag = f" (-{pr['discount_pct']}%)" if pr["discount_pct"] > 0 else ""
+        markup.add(
+            InlineKeyboardButton(
+                f"{plan['title']} — {pr['stars']} ⭐ / {pr['rub']} ₽{disc_tag}",
+                callback_data=f"plan_{plan_id}",
+            )
+        )
+    markup.add(InlineKeyboardButton("🎁 Ввести промокод", callback_data="enter_promo"))
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def _build_progress_bar(current, target, width=10):
+    ratio = max(0.0, min(1.0, current / max(1, target)))
+    filled = int(round(ratio * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+def build_ref_view(user_id):
+    username = get_bot_username()
+    if not username:
+        return "⏳ Не удалось сформировать ссылку. Попробуй через пару секунд.", InlineKeyboardMarkup()
+
+    _, _, ref_count, _, _, _, _, _ = get_user_profile_stats(user_id)
+    ref_link = f"https://t.me/{username}?start=ref_{user_id}"
+    share_text = "Оцени внешность по 8-балльной шкале в Adonis PSL:"
+    share_url = f"https://t.me/share/url?url={quote(ref_link)}&text={quote(share_text)}"
+
+    ladder_lines = []
+    next_target = None
+    for req_refs, pro_days in REF_MILESTONES:
+        if ref_count >= req_refs:
+            ladder_lines.append(f"✅ <b>{req_refs} друзей</b> → PRO на {pro_days} дн.")
+        else:
+            if next_target is None:
+                next_target = (req_refs, pro_days)
+            ladder_lines.append(f"🔒 <b>{req_refs} друзей</b> → PRO на {pro_days} дн.")
+
+    if next_target:
+        req_refs, pro_days = next_target
+        bar = _build_progress_bar(ref_count, req_refs, width=10)
+        left = req_refs - ref_count
+        progress_txt = (
+            f"\nДо <b>PRO на {pro_days} дн.</b>: <code>[{bar}]</code> "
+            f"<b>{ref_count}/{req_refs}</b> (осталось {left})"
+        )
+    else:
+        progress_txt = "\n🏆 <b>Все ступени реферальной лестницы пройдены!</b>"
+
+    text = (
+        "<b>🤝 Пригласить друга</b>\n\n"
+        f"<blockquote>За каждого нового пользователя по твоей ссылке начисляется "
+        f"<b>+{REFERRAL_BONUS} бесплатный скан</b>.\n"
+        f"Приглашено друзей: <b>{ref_count}</b>{progress_txt}</blockquote>\n\n"
+        "<b>🏆 Реферальная лестница:</b>\n"
+        + "\n".join(ladder_lines)
+        + f"\n\nТвоя ссылка (нажми, чтобы скопировать):\n<code>{html.escape(ref_link)}</code>"
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("📤 Поделиться ссылкой", url=share_url))
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def build_channel_bonus_view():
+    url = get_channel_url()
+    text = (
+        f"<b>📢 Бонус +{CHANNEL_SUB_BONUS} бесплатный скан</b>\n\n"
+        "<blockquote>Подпишись на наш официальный Telegram-канал с обновлениями, разборами и промокодами, "
+        "затем нажми кнопку проверки ниже.</blockquote>"
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    if url:
+        markup.add(InlineKeyboardButton("📣 Перейти в канал", url=url))
+    markup.add(InlineKeyboardButton("✅ Проверить подписку", callback_data="check_sub"))
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def build_support_view():
+    support_url = get_support_url()
+    text = (
+        "<b>🆘 Поддержка</b>\n\n"
+        "<blockquote>Оплата через Telegram Stars начисляется автоматически за 1 секунду. "
+        "Перевод на карту (только РФ) подтверждается администратором после проверки чека.</blockquote>\n\n"
+        "Если возник вопрос по оплате или работе бота — напиши напрямую администратору:"
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    if support_url:
+        markup.add(InlineKeyboardButton("💬 Написать администратору", url=support_url))
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def send_adult_confirm(chat_id):
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("✅ Мне есть 18 лет", callback_data="confirm_18"))
+    bot.send_message(
+        chat_id,
+        "Доступ к оценке внешности разрешён только пользователям 18+.\n"
+        "Подтверди свой возраст кнопкой ниже:",
+        reply_markup=markup,
+    )
+
+
+def parse_referrer_id(text):
+    parts = (text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    m = re.match(r"^ref_(\d+)$", parts[1].strip())
+    return int(m.group(1)) if m else None
+
+
+def parse_start_promo(text):
+    parts = (text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    m = re.match(r"^promo_([A-Za-z0-9_\-]{2,24})$", parts[1].strip())
+    return m.group(1).upper() if m else None
+
+
+@bot.message_handler(commands=["start"])
+def cmd_start(message):
+    user_id = message.from_user.id
+    clear_pending_modes(user_id)
+    if is_user_banned(user_id):
+        bot.send_message(message.chat.id, "⛔ Доступ к боту ограничен.")
+        return
+    if not check_rate_limit(user_id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+
+    referrer_id = parse_referrer_id(message.text)
+    start_promo = parse_start_promo(message.text)
+    rewarded_referrer, milestone_msg = register_user_if_new(message.from_user, referrer_id=referrer_id)
+    if rewarded_referrer:
+        try:
+            ref_notice = (
+                f"🎉 По твоей ссылке присоединился новый пользователь!\n"
+                f"Начислен бонус: <b>+{REFERRAL_BONUS} бесплатный скан</b>."
+            )
+            if milestone_msg:
+                ref_notice += f"\n\n{milestone_msg}"
+            bot.send_message(rewarded_referrer, ref_notice, parse_mode="HTML")
+        except Exception as e:
+            log_error(f"Не удалось уведомить реферера {rewarded_referrer}: {e}")
+
+    if start_promo:
+        _, _, promo_msg = activate_promocode_for_user(user_id, start_promo)
+        bot.send_message(message.chat.id, promo_msg, parse_mode="HTML")
+
+    _, _, _, is_adult = get_user_access(user_id)
+    text, markup = build_main_menu_view(user_id)
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+    if not is_adult and not is_admin(user_id):
+        send_adult_confirm(message.chat.id)
+
+
+@bot.message_handler(commands=["buy"])
+def cmd_buy(message):
+    touch_user(message.from_user)
+    if is_user_banned(message.from_user.id):
+        return
+    if not check_rate_limit(message.from_user.id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+    clear_pending_modes(message.from_user.id)
+    text, markup = build_buy_menu_view(message.from_user.id)
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.message_handler(commands=["ref"])
+def cmd_ref(message):
+    touch_user(message.from_user)
+    if is_user_banned(message.from_user.id):
+        return
+    if not check_rate_limit(message.from_user.id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+    clear_pending_modes(message.from_user.id)
+    text, markup = build_ref_view(message.from_user.id)
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.message_handler(commands=["scale"])
+def cmd_scale(message):
+    touch_user(message.from_user)
+    if is_user_banned(message.from_user.id):
+        return
+    if not check_rate_limit(message.from_user.id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+    clear_pending_modes(message.from_user.id)
+    text, markup = build_psl_scale_view()
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.message_handler(commands=["paysupport"])
+def cmd_paysupport(message):
+    touch_user(message.from_user)
+    if is_user_banned(message.from_user.id):
+        return
+    if not check_rate_limit(message.from_user.id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+    clear_pending_modes(message.from_user.id)
+    text, markup = build_support_view()
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+
+def get_admin_help_text():
+    return (
+        "<b>👑 Админ-команды (через точку)</b>\n\n"
+        "<blockquote>"
+        "• <code>. создать промокод 10% ADONIS 50 24ч</code> — создать промо\n"
+        "  <i>Награда: 10% / 2скана / 3pro | лимит и время (30м/24ч/7д) опц.</i>\n"
+        "• <code>. промокоды</code> — список промокодов и активаций\n"
+        "• <code>. удалить промокод ADONIS</code> — отключить промокод\n"
+        "• <code>. выдать всем 1</code> — выдать +N сканов всем пользователям\n"
+        "• <code>. забрать у всех 1</code> / <code>все</code> — списать N (или все) сканы у всех\n"
+        "• <code>. забрать стартовый</code> — забрать 1 неиспользованный старт-скан у новичков\n"
+        "• <code>. выдать сканы @user 10</code> / <code>. забрать сканы @user 5</code>\n"
+        "• <code>. выдать премиум @user 30</code> / <code>навсегда</code>\n"
+        "• <code>. забрать премиум @user</code> — снять PRO\n"
+        "• <code>. модель</code> — меню смены модели Gemini (или <code>. модель имя</code>)\n"
+        "• <code>. стата</code> — сводка по боту (+ сканы за сегодня)\n"
+        "• <code>. юзеры [15]</code> — последние пользователи и их активность\n"
+        "• <code>. инфо @user</code> — досье по юзеру\n"
+        "• <code>. рассылка</code> — рассылка с предпросмотром\n"
+        "• <code>. бан @user</code> / <code>. разбан @user</code>\n"
+        "• <code>. очистить кэш</code> — сбросить кэш фото\n"
+        "• <code>. админ</code> — эта шпаргалка"
+        "</blockquote>\n\n"
+        "Вместо <code>@user</code> можно указывать числовой <code>ID</code>."
+    )
+
+
+def build_model_manager_view():
+    active = get_active_models()
+    active_str = "\n".join(f"• <code>{html.escape(m)}</code>" for m in active)
+    text = (
+        "<b>🤖 Управление моделью Gemini</b>\n\n"
+        f"<blockquote>Активная сейчас:\n{active_str}</blockquote>\n\n"
+        "Выбери быстрый пресет кнопкой ниже, введи свою модель вручную "
+        "или напиши команду:\n"
+        "<code>. модель gemini-3.5-flash-lite</code>\n"
+        "<i>Можно указать несколько через запятую (запасной фолбэк).</i>"
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    for preset in PRESET_MODELS:
+        prefix = "✅ " if active == [preset] else ""
+        markup.add(InlineKeyboardButton(f"{prefix}{preset}", callback_data=f"setmodel_{preset}"))
+    markup.add(InlineKeyboardButton("✏️ Ввести свою модель", callback_data="model_custom"))
+    markup.add(InlineKeyboardButton("🔄 Сбросить паузу 404/429", callback_data="model_reset_cd"))
+    markup.add(InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
+    return text, markup
+
+
+def get_bot_stats_text():
+    now = int(time.time())
+    today = get_today_str()
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        total = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE date(created_at, 'localtime') = ?", (today,))
+        new_today = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(pro_tier, 0) = 1 AND pro_until > ?", (now,))
+        pro30_cnt = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(pro_tier, 0) >= 2")
+        pro_life_cnt = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(is_banned, 0) = 1")
+        banned_cnt = c.fetchone()[0]
+        c.execute("SELECT COALESCE(SUM(scans_count), 0), COALESCE(SUM(referrals_count), 0) FROM users")
+        total_scans, total_refs = c.fetchone()
+        c.execute("SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM stars_payments")
+        stars_cnt, stars_sum = c.fetchone()
+        c.execute("SELECT COUNT(*) FROM payment_requests WHERE status = 'approved'")
+        card_cnt = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM photo_cache")
+        cached = c.fetchone()[0]
+        c.execute("SELECT COALESCE(scans, 0) FROM daily_stats WHERE day = ?", (today,))
+        row_today = c.fetchone()
+        scans_today = row_today[0] if row_today else 0
+        c.execute(
+            """
+            SELECT COUNT(*) FROM promocodes
+            WHERE is_active = 1
+              AND (expires_at = 0 OR expires_at > ?)
+              AND (max_uses = 0 OR used_count < max_uses)
+            """,
+            (now,),
+        )
+        active_promos = c.fetchone()[0]
+
+    mp_status = "✅ активен" if is_mediapipe_available() else "⚠️ визуальный режим"
+    models_str = ", ".join(get_active_models())
+    return (
+        "<b>📊 Статистика ADONIS PSL</b>\n\n"
+        "<blockquote>"
+        f"Пользователей: <b>{total}</b> (новых сегодня: <b>+{new_today}</b>)\n"
+        f"PRO 30д: <b>{pro30_cnt}</b> | PRO Навсегда: <b>{pro_life_cnt}</b> | Бан: <b>{banned_cnt}</b>\n"
+        f"Всего сканов: <b>{total_scans}</b> (сегодня: <b>+{scans_today}</b>) | Рефералов: <b>{total_refs}</b>\n"
+        f"Stars: <b>{stars_cnt}</b> ({stars_sum} ⭐) | Картой: <b>{card_cnt}</b>\n"
+        f"Очередь: <b>{_scan_queue.qsize()}</b> | Кэш фото: <b>{cached}</b> | Промо: <b>{active_promos}</b>\n"
+        f"Модели: <code>{html.escape(models_str)}</code>\n"
+        f"MediaPipe 468 точек: <b>{mp_status}</b>"
+        "</blockquote>"
+    )
+
+
+def build_user_dossier_text(target_id):
+    free_limit, pro_tier, pro_until, is_adult = get_user_access(target_id)
+    scans_cnt, best_score, ref_count, uname, fname, banned, last_score, prev_score = get_user_profile_stats(target_id)
+
+    extra_str = f" + {free_limit} доп." if free_limit > 0 else ""
+    if pro_tier >= 2:
+        tier_str = f"💎 PRO Навсегда (сегодня {get_pro_remaining_today(target_id, pro_tier)}/{PRO_LIFE_DAILY_LIMIT}{extra_str})"
+    elif pro_tier == 1:
+        tier_str = f"👑 PRO до {format_date_from_ts(pro_until)} (сегодня {get_pro_remaining_today(target_id, pro_tier)}/{PRO30_DAILY_LIMIT}{extra_str})"
+    else:
+        tier_str = f"⚡ Базовый (сканов: {free_limit})"
+
+    uname_str = f"@{uname}" if uname else "нет"
+    ban_str = "⛔ Забанен" if banned else "✅ Активен"
+    best_str = f"{best_score:.1f}/8" if best_score > 0 else "—"
+    last_str = f"{last_score:.1f}/8" if last_score > 0 else "—"
+    if last_score > 0 and prev_score > 0:
+        d = round(last_score - prev_score, 1)
+        last_str += f" ({d:+.1f})"
+
+    return (
+        f"<b>🗂 Досье пользователя</b>\n\n"
+        "<blockquote>"
+        f"ID: <code>{target_id}</code>\n"
+        f"Username: {html.escape(uname_str)}\n"
+        f"Имя: {html.escape(fname or '—')}\n"
+        f"Статус: {ban_str} | 18+: {'да' if is_adult else 'нет'}\n"
+        f"Тариф: {tier_str}\n"
+        f"Сканов всего: <b>{scans_cnt}</b> | Лучший: <b>{best_str}</b> | Последний: <b>{last_str}</b>\n"
+        f"Рефералов: <b>{ref_count}</b>"
+        "</blockquote>"
+    )
+
+
+@bot.message_handler(commands=["admin"])
+def cmd_admin_slash(message):
+    if is_admin(message.from_user.id):
+        bot.reply_to(message, get_admin_help_text(), parse_mode="HTML")
+
+
+@bot.message_handler(commands=["model", "models"])
+def cmd_model_slash(message):
+    if not is_admin(message.from_user.id):
+        return
+    clear_pending_modes(message.from_user.id)
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 2 and parts[1].strip():
+        arg = parts[1].strip()
+        if arg.lower() in ("сброс", "reset", "default"):
+            saved = set_active_models(DEFAULT_MODELS)
+            bot.reply_to(
+                message,
+                f"✅ Модель сброшена на стандартную: <code>{html.escape(', '.join(saved))}</code>",
+                parse_mode="HTML",
+            )
+            return
+        parsed = parse_models_input(arg)
+        if not parsed:
+            bot.reply_to(
+                message,
+                "⚠️ Некорректное имя модели. Пример: <code>/model gemini-3.5-flash-lite</code>",
+                parse_mode="HTML",
+            )
+            return
+        saved = set_active_models(parsed)
+        bot.reply_to(
+            message,
+            f"✅ Активная модель обновлена:\n<code>{html.escape(', '.join(saved))}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    text, markup = build_model_manager_view()
+    bot.reply_to(message, text, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.message_handler(commands=["stats"])
+def cmd_stats_slash(message):
+    if is_admin(message.from_user.id):
+        bot.reply_to(message, get_bot_stats_text(), parse_mode="HTML")
+
+
+@bot.message_handler(commands=["clear_cache"])
+def cmd_clear_cache_slash(message):
+    if not is_admin(message.from_user.id):
+        return
+    with db_conn() as conn:
+        conn.cursor().execute("DELETE FROM photo_cache")
+    bot.reply_to(message, "✅ Кэш фото очищен.")
+
+
+@bot.message_handler(
+    func=lambda m: bool(
+        m.text
+        and m.text.lstrip().startswith(".")
+        and is_admin(m.from_user.id)
+        and not is_awaiting_broadcast(m.from_user.id)
+        and not is_awaiting_model(m.from_user.id)
+        and not is_awaiting_promo(m.from_user.id)
+    ),
+    content_types=["text"],
+)
+def handle_admin_dot_commands(message):
+    user_id = message.from_user.id
+    body = re.sub(r"\s+", " ", message.text.lstrip()[1:].strip())
+    low = body.lower()
+
+    if low in ("админ", "admin", "помощь", "help"):
+        bot.reply_to(message, get_admin_help_text(), parse_mode="HTML")
+        return
+
+    if low in ("стата", "статистика", "stats"):
+        bot.reply_to(message, get_bot_stats_text(), parse_mode="HTML")
+        return
+
+    m_users = re.match(r"^(?:юзеры|пользователи|users)(?:\s+(\d+))?$", body, flags=re.IGNORECASE)
+    if m_users:
+        lim = max(1, min(30, int(m_users.group(1)))) if m_users.group(1) else 15
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                """
+                SELECT user_id, COALESCE(username, ''), COALESCE(first_name, ''),
+                       COALESCE(free_limit, 0), COALESCE(pro_tier, 0),
+                       COALESCE(scans_count, 0), COALESCE(best_score, 0.0)
+                FROM users
+                ORDER BY created_at DESC, user_id DESC
+                LIMIT ?
+                """,
+                (lim,),
+            )
+            rows = c.fetchall()
+        if not rows:
+            bot.reply_to(message, "Пользователей пока нет.")
+            return
+        lines = []
+        for uid, uname, fname, flim, ptier, scnt, bscore in rows:
+            tag = f"@{uname}" if uname else (fname or str(uid))
+            tier_icon = "💎" if ptier >= 2 else ("👑" if ptier == 1 else "⚡")
+            score_part = f" | max {bscore:.1f}" if bscore > 0 else ""
+            lines.append(
+                f"{tier_icon} <code>{uid}</code> ({html.escape(tag[:20])}) — "
+                f"баланс: <b>{flim}</b> | сканов: <b>{scnt}</b>{score_part}"
+            )
+        bot.reply_to(
+            message,
+            f"<b>👥 Последние {len(rows)} пользователей</b>\n\n<blockquote>" + "\n".join(lines) + "</blockquote>",
+            parse_mode="HTML",
+        )
+        return
+
+    m_give_all = re.match(
+        r"^выдать\s+всем(?:\s+(?:сканы|сканов|рейты|рейтов))?\s+(\d+)$",
+        body,
+        flags=re.IGNORECASE,
+    )
+    if m_give_all:
+        amount = int(m_give_all.group(1))
+        if amount <= 0 or amount > 1000:
+            bot.reply_to(message, "⚠️ Укажи число от 1 до 1000.")
+            return
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                "UPDATE users SET free_limit = free_limit + ? WHERE COALESCE(is_banned, 0) = 0",
+                (amount,),
+            )
+            affected = c.rowcount
+        bot.reply_to(
+            message,
+            f"✅ Выдано <b>+{amount} сканов</b> всем активным пользователям (затронуто: <b>{affected}</b>).",
+            parse_mode="HTML",
+        )
+        return
+
+    m_take_all = re.match(
+        r"^(?:забрать\s+у\s+всех|списать\s+у\s+всех)(?:\s+(?:сканы|сканов|рейты|рейтов))?\s+(\S+)$",
+        body,
+        flags=re.IGNORECASE,
+    )
+    if m_take_all:
+        arg = m_take_all.group(1).lower()
+        if arg in ("все", "всё", "all", "0"):
+            with db_conn() as conn:
+                c = conn.cursor()
+                c.execute("UPDATE users SET free_limit = 0 WHERE free_limit > 0")
+                affected = c.rowcount
+            bot.reply_to(
+                message,
+                f"🗑 Все сканы (free_limit) обнулены у <b>{affected}</b> пользователей.",
+                parse_mode="HTML",
+            )
+            return
+        if not arg.isdigit() or int(arg) <= 0:
+            bot.reply_to(
+                message,
+                "⚠️ Укажи число (> 0) или слово <code>все</code>. Пример: <code>. забрать у всех 1</code>",
+                parse_mode="HTML",
+            )
+            return
+        amount = int(arg)
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                "UPDATE users SET free_limit = MAX(0, free_limit - ?) WHERE free_limit > 0",
+                (amount,),
+            )
+            affected = c.rowcount
+        bot.reply_to(
+            message,
+            f"✅ Списано до <b>-{amount} сканов</b> у всех пользователей с балансом (затронуто: <b>{affected}</b>).",
+            parse_mode="HTML",
+        )
+        return
+
+    if low in ("забрать стартовый", "снять стартовый"):
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                """
+                UPDATE users
+                SET free_limit = MAX(0, free_limit - 1)
+                WHERE free_limit > 0
+                  AND COALESCE(scans_count, 0) = 0
+                  AND COALESCE(pro_tier, 0) = 0
+                  AND COALESCE(channel_bonus_claimed, 0) = 0
+                  AND COALESCE(referrals_count, 0) = 0
+                """
+            )
+            affected = c.rowcount
+        bot.reply_to(
+            message,
+            f"✅ Неиспользованный стартовый скан списан у <b>{affected}</b> новичков "
+            "(подписчики ТГК, реферальные и купленные сканы не затронуты).",
+            parse_mode="HTML",
+        )
+        return
+
+    if low in ("очистить кэш", "кэш", "clear_cache"):
+        with db_conn() as conn:
+            conn.cursor().execute("DELETE FROM photo_cache")
+        bot.reply_to(message, "✅ Кэш фото очищен.")
+        return
+
+    if low in ("промокоды", "промо", "promos"):
+        rows = list_promocodes_db(limit=25)
+        if not rows:
+            bot.reply_to(
+                message,
+                "🎁 Промокодов пока нет.\n"
+                "Создать: <code>. создать промокод 10% ADONIS 50 24ч</code>",
+                parse_mode="HTML",
+            )
+            return
+        now = int(time.time())
+        lines = []
+        for code, ptype, val, max_u, used_c, exp_at, is_act in rows:
+            expired = bool(exp_at > 0 and now >= exp_at)
+            exhausted = bool(max_u > 0 and used_c >= max_u)
+            icon = "✅" if (is_act and not expired and not exhausted) else "⛔"
+            lim_str = f"{used_c}/{max_u}" if max_u > 0 else f"{used_c}/∞"
+            time_str = format_time_left(exp_at)
+            lines.append(
+                f"{icon} <code>{html.escape(code)}</code> — {format_promo_reward(ptype, val)} "
+                f"| {lim_str} | {time_str}"
+            )
+        bot.reply_to(
+            message,
+            "<b>🎁 Промокоды</b>\n\n<blockquote>" + "\n".join(lines) + "</blockquote>",
+            parse_mode="HTML",
+        )
+        return
+
+    m_del_promo = re.match(r"^(?:удалить|отключить)\s+промокод\s+(\S+)$", body, flags=re.IGNORECASE)
+    if m_del_promo:
+        code = m_del_promo.group(1).strip().upper()
+        if deactivate_promocode_db(code):
+            bot.reply_to(message, f"🗑 Промокод <code>{html.escape(code)}</code> отключён.", parse_mode="HTML")
+        else:
+            bot.reply_to(message, f"⚠️ Промокод <code>{html.escape(code)}</code> не найден.", parse_mode="HTML")
+        return
+
+    m_new_promo = re.match(r"^создать\s+промокод\s+(.+)$", body, flags=re.IGNORECASE)
+    if m_new_promo:
+        tokens = m_new_promo.group(1).strip().split()
+        if len(tokens) < 2:
+            bot.reply_to(
+                message,
+                "⚠️ Формат: <code>. создать промокод 10% ADONIS [лимит] [время]</code>\n"
+                "Примеры:\n"
+                "• <code>. создать промокод 10% ADONIS 50 24ч</code>\n"
+                "• <code>. создать промокод 2скана START 100 7д</code>\n"
+                "• <code>. создать промокод 3pro VIP 20</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        ptype, pval = parse_promo_reward_token(tokens[0])
+        if not ptype:
+            bot.reply_to(
+                message,
+                "⚠️ Некорректная награда. Укажи: <code>10%</code> (1–90%), <code>2скана</code> или <code>3pro</code>.",
+                parse_mode="HTML",
+            )
+            return
+
+        code = tokens[1].strip().upper()
+        if not re.fullmatch(r"[A-Z0-9_\-]{2,24}", code):
+            bot.reply_to(
+                message,
+                "⚠️ Код должен быть длиной 2–24 символа (только латиница, цифры, _ или -).",
+                parse_mode="HTML",
+            )
+            return
+
+        max_uses = 0
+        duration_sec = 0
+        for extra in tokens[2:]:
+            if extra.isdigit():
+                max_uses = int(extra)
+                continue
+            parsed_dur = parse_promo_duration_token(extra)
+            if parsed_dur is not None:
+                duration_sec = parsed_dur
+                continue
+            bot.reply_to(
+                message,
+                f"⚠️ Не понял параметр <code>{html.escape(extra)}</code>.\n"
+                "Лимит — число (например <code>50</code>), время — <code>30м</code>, <code>24ч</code> или <code>7д</code>.",
+                parse_mode="HTML",
+            )
+            return
+
+        expires_at = create_promocode_db(code, ptype, pval, max_uses=max_uses, duration_sec=duration_sec)
+        uname = get_bot_username()
+        link_line = (
+            f"\nСсылка автоактивации:\n<code>https://t.me/{uname}?start=promo_{code}</code>"
+            if uname
+            else ""
+        )
+        lim_txt = f"{max_uses} активаций" if max_uses > 0 else "безлимит"
+        exp_txt = f"до {format_datetime_from_ts(expires_at)} ({format_time_left(expires_at)})" if expires_at > 0 else "бессрочно"
+        bot.reply_to(
+            message,
+            f"✅ <b>Промокод создан!</b>\n\n"
+            f"<blockquote>Код: <code>{html.escape(code)}</code>\n"
+            f"Награда: <b>{format_promo_reward(ptype, pval)}</b>\n"
+            f"Лимит: <b>{lim_txt}</b>\n"
+            f"Срок: <b>{exp_txt}</b></blockquote>"
+            f"{link_line}",
+            parse_mode="HTML",
+        )
+        return
+
+    m_model = re.match(r"^(?:модель|модели|model|models)(?:\s+(.+))?$", body, flags=re.IGNORECASE)
+    if m_model:
+        clear_pending_modes(user_id)
+        arg = (m_model.group(1) or "").strip()
+        if not arg:
+            text, markup = build_model_manager_view()
+            bot.reply_to(message, text, parse_mode="HTML", reply_markup=markup)
+            return
+        if arg.lower() in ("сброс", "reset", "default"):
+            saved = set_active_models(DEFAULT_MODELS)
+            bot.reply_to(
+                message,
+                f"✅ Модель сброшена на стандартную: <code>{html.escape(', '.join(saved))}</code>",
+                parse_mode="HTML",
+            )
+            return
+        parsed = parse_models_input(arg)
+        if not parsed:
+            bot.reply_to(
+                message,
+                "⚠️ Некорректное название модели. Пример: <code>. модель gemini-3.5-flash-lite</code>",
+                parse_mode="HTML",
+            )
+            return
+        saved = set_active_models(parsed)
+        bot.reply_to(
+            message,
+            f"✅ Активная модель обновлена и сохранена:\n<code>{html.escape(', '.join(saved))}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    if low == "рассылка":
+        clear_pending_modes(user_id)
+        with _broadcast_lock:
+            _broadcast_state[user_id] = {"step": "await_content"}
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="bc_cancel"))
+        bot.reply_to(
+            message,
+            "📢 <b>Режим рассылки</b>\n\n"
+            "Отправь следующим сообщением <b>текст</b> или <b>фото с подписью</b>. "
+            "Я покажу предпросмотр с кнопкой подтверждения перед отправкой.",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return
+
+    m_grant = re.match(r"^выдать\s+премиум\s+(\S+)(?:\s+(\S+))?$", body, flags=re.IGNORECASE)
+    if m_grant:
+        target_id = resolve_target_user(m_grant.group(1))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе. Укажи ID или дождись, пока он напишет боту.")
+            return
+        dur_raw = (m_grant.group(2) or "навсегда").lower()
+        ensure_user(target_id)
+
+        if dur_raw in ("навсегда", "0", "life", "forever"):
+            with db_conn() as conn:
+                conn.cursor().execute(
+                    "UPDATE users SET is_premium = 1, pro_tier = 2, pro_until = 0 WHERE user_id = ?",
+                    (target_id,),
+                )
+            bot.reply_to(message, f"✅ Выдан <b>PRO Навсегда</b> для <code>{target_id}</code>.", parse_mode="HTML")
+            try:
+                bot.send_message(target_id, "💎 Тебе активирован <b>PRO Навсегда</b>!", parse_mode="HTML")
+            except Exception:
+                pass
+            return
+
+        if not dur_raw.isdigit() or int(dur_raw) <= 0:
+            bot.reply_to(message, "⚠️ Укажи число дней (> 0) или слово <code>навсегда</code>.", parse_mode="HTML")
+            return
+
+        days = int(dur_raw)
+        now = int(time.time())
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                "SELECT COALESCE(pro_tier, 0), COALESCE(pro_until, 0) FROM users WHERE user_id = ?",
+                (target_id,),
+            )
+            row = c.fetchone()
+            cur_tier = row[0] if row else 0
+            cur_until = row[1] if row else 0
+            if cur_tier >= 2:
+                bot.reply_to(
+                    message,
+                    f"ℹ️ У <code>{target_id}</code> уже активен <b>PRO Навсегда</b>. "
+                    "Чтобы снять его, используй <code>. забрать премиум</code>.",
+                    parse_mode="HTML",
+                )
+                return
+            base = max(now, cur_until) if cur_tier == 1 else now
+            until_ts = base + days * 86400
+            c.execute(
+                "UPDATE users SET is_premium = 1, pro_tier = 1, pro_until = ? WHERE user_id = ?",
+                (until_ts, target_id),
+            )
+        bot.reply_to(
+            message,
+            f"✅ Выдан <b>PRO на {days} дн.</b> (до {format_date_from_ts(until_ts)}) для <code>{target_id}</code>.",
+            parse_mode="HTML",
+        )
+        try:
+            bot.send_message(
+                target_id,
+                f"👑 Тебе активирован <b>PRO на {days} дн.</b> (до {format_date_from_ts(until_ts)})!",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return
+
+    m_rev = re.match(r"^забрать\s+премиум\s+(\S+)$", body, flags=re.IGNORECASE)
+    if m_rev:
+        target_id = resolve_target_user(m_rev.group(1))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        ensure_user(target_id)
+        with db_conn() as conn:
+            conn.cursor().execute(
+                "UPDATE users SET is_premium = 0, pro_tier = 0, pro_until = 0 WHERE user_id = ?",
+                (target_id,),
+            )
+        bot.reply_to(message, f"❌ PRO снят у <code>{target_id}</code>.", parse_mode="HTML")
+        return
+
+    m_scans = re.match(r"^выдать\s+сканы\s+(\S+)\s+(\d+)$", body, flags=re.IGNORECASE)
+    if m_scans:
+        target_id = resolve_target_user(m_scans.group(1))
+        amount = int(m_scans.group(2))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        if amount <= 0:
+            bot.reply_to(message, "⚠️ Количество сканов должно быть больше 0.")
+            return
+        ensure_user(target_id)
+        with db_conn() as conn:
+            conn.cursor().execute(
+                "UPDATE users SET free_limit = free_limit + ? WHERE user_id = ?",
+                (amount, target_id),
+            )
+        bot.reply_to(message, f"✅ Начислено <b>+{amount} сканов</b> юзеру <code>{target_id}</code>.", parse_mode="HTML")
+        try:
+            bot.send_message(target_id, f"⚡ Тебе начислено <b>+{amount} сканов</b> на баланс!", parse_mode="HTML")
+        except Exception:
+            pass
+        return
+
+    m_take_user = re.match(
+        r"^забрать\s+(?:сканы|рейты)\s+(\S+)\s+(\S+)$",
+        body,
+        flags=re.IGNORECASE,
+    )
+    if m_take_user:
+        target_id = resolve_target_user(m_take_user.group(1))
+        arg = m_take_user.group(2).lower()
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        ensure_user(target_id)
+        if arg in ("все", "всё", "all", "0"):
+            with db_conn() as conn:
+                conn.cursor().execute("UPDATE users SET free_limit = 0 WHERE user_id = ?", (target_id,))
+            bot.reply_to(message, f"🗑 Все сканы обнулены у <code>{target_id}</code>.", parse_mode="HTML")
+            return
+        if not arg.isdigit() or int(arg) <= 0:
+            bot.reply_to(message, "⚠️ Укажи число (> 0) или <code>все</code>.", parse_mode="HTML")
+            return
+        amount = int(arg)
+        with db_conn() as conn:
+            conn.cursor().execute(
+                "UPDATE users SET free_limit = MAX(0, free_limit - ?) WHERE user_id = ?",
+                (amount, target_id),
+            )
+        bot.reply_to(message, f"✅ Списано до <b>-{amount} сканов</b> у <code>{target_id}</code>.", parse_mode="HTML")
+        return
+
+    m_info = re.match(r"^инфо\s+(\S+)$", body, flags=re.IGNORECASE)
+    if m_info:
+        target_id = resolve_target_user(m_info.group(1))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        bot.reply_to(message, build_user_dossier_text(target_id), parse_mode="HTML")
+        return
+
+    m_ban = re.match(r"^(бан|разбан)\s+(\S+)$", body, flags=re.IGNORECASE)
+    if m_ban:
+        action = m_ban.group(1).lower()
+        target_id = resolve_target_user(m_ban.group(2))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        if is_admin(target_id):
+            bot.reply_to(message, "⚠️ Нельзя забанить администратора.")
+            return
+        ensure_user(target_id)
+        ban_val = 1 if action == "бан" else 0
+        with db_conn() as conn:
+            conn.cursor().execute("UPDATE users SET is_banned = ? WHERE user_id = ?", (ban_val, target_id))
+        msg = f"⛔ Пользователь <code>{target_id}</code> забанен." if ban_val else f"✅ Пользователь <code>{target_id}</code> разбанен."
+        bot.reply_to(message, msg, parse_mode="HTML")
+        return
+
+    bot.reply_to(message, "⚠️ Неизвестная команда. Напиши <code>. админ</code> для списка.", parse_mode="HTML")
+
+
+def _prepare_broadcast_preview(message):
+    user_id = message.from_user.id
+    with _broadcast_lock:
+        state = _broadcast_state.get(user_id)
+    if not state or state.get("step") != "await_content":
+        return False
+
+    if message.content_type == "photo":
+        payload = {
+            "step": "ready",
+            "type": "photo",
+            "file_id": message.photo[-1].file_id,
+            "caption": message.caption or "",
+        }
+    elif message.content_type == "text":
+        payload = {
+            "step": "ready",
+            "type": "text",
+            "text": message.text,
+        }
+    else:
+        bot.reply_to(message, "⚠️ Для рассылки отправь текст или фото с подписью.")
+        return True
+
+    with _broadcast_lock:
+        _broadcast_state[user_id] = payload
+
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(is_banned, 0) = 0")
+        total_targets = c.fetchone()[0]
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton(f"✅ Отправить ({total_targets})", callback_data="bc_send"),
+        InlineKeyboardButton("❌ Отмена", callback_data="bc_cancel"),
+    )
+
+    bot.send_message(message.chat.id, "👁 <b>Предпросмотр рассылки:</b>", parse_mode="HTML")
+    if payload["type"] == "photo":
+        bot.send_photo(message.chat.id, payload["file_id"], caption=payload["caption"], reply_markup=markup)
+    else:
+        bot.send_message(message.chat.id, payload["text"], reply_markup=markup)
+    return True
+
+
+def _send_broadcast_item(uid, payload):
+    if payload["type"] == "photo":
+        bot.send_photo(uid, payload["file_id"], caption=payload["caption"])
+    else:
+        bot.send_message(uid, payload["text"])
+
+
+def _run_broadcast_worker(admin_chat_id, payload):
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM users WHERE COALESCE(is_banned, 0) = 0")
+        user_ids = [row[0] for row in c.fetchall()]
+
+    ok_cnt, fail_cnt = 0, 0
+    for uid in user_ids:
+        sent = False
+        for attempt in range(2):
+            try:
+                _send_broadcast_item(uid, payload)
+                sent = True
+                break
+            except telebot.apihelper.ApiTelegramException as api_err:
+                if getattr(api_err, "error_code", None) == 429 and attempt == 0:
+                    retry_after = 3
+                    try:
+                        retry_after = int((api_err.result_json or {}).get("parameters", {}).get("retry_after", 3))
+                    except Exception:
+                        retry_after = 3
+                    time.sleep(min(max(1, retry_after), 60) + 0.5)
+                    continue
+                break
+            except Exception:
+                break
+        if sent:
+            ok_cnt += 1
+        else:
+            fail_cnt += 1
+        time.sleep(0.05)
+
+    try:
+        bot.send_message(
+            admin_chat_id,
+            f"📢 <b>Рассылка завершена!</b>\n"
+            f"Доставлено: <b>{ok_cnt}</b> | Ошибок/блок: <b>{fail_cnt}</b>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
+@bot.message_handler(
+    func=lambda m: is_admin(m.from_user.id) and is_awaiting_broadcast(m.from_user.id),
+    content_types=["text", "photo"],
+)
+def handle_admin_broadcast_input(message):
+    _prepare_broadcast_preview(message)
+
+
+@bot.message_handler(
+    func=lambda m: is_admin(m.from_user.id) and is_awaiting_model(m.from_user.id),
+    content_types=["text"],
+)
+def handle_admin_model_input(message):
+    user_id = message.from_user.id
+    parsed = parse_models_input(message.text)
+    if not parsed:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="model_cancel"))
+        bot.reply_to(
+            message,
+            "⚠️ Некорректное имя модели. Введи название латиницей, например:\n"
+            "<code>gemini-3.5-flash-lite</code>\n"
+            "<i>Или несколько моделей через запятую.</i>",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return
+
+    clear_awaiting_model(user_id)
+    saved = set_active_models(parsed)
+    text, markup = build_model_manager_view()
+    bot.reply_to(
+        message,
+        f"✅ Модель обновлена и сохранена: <code>{html.escape(', '.join(saved))}</code>\n\n{text}",
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
+
+
+def build_report_markup(photo_hash, include_profile_btn=True, is_profile=False):
+    markup = InlineKeyboardMarkup(row_width=2)
+    if photo_hash:
+        btn_label = "📊 Подробный разбор профиля" if is_profile else "📊 Подробный разбор"
+        markup.add(InlineKeyboardButton(btn_label, callback_data=f"full_{photo_hash}"))
+        if not is_profile:
+            markup.add(InlineKeyboardButton("📈 План роста (PRO)", callback_data=f"growth_{photo_hash}"))
+    row2 = []
+    if include_profile_btn and not is_profile:
+        row2.append(InlineKeyboardButton("📐 Профиль (PRO)", callback_data="profile_scan"))
+    row2.append(InlineKeyboardButton("📖 Шкала", callback_data="psl_scale_new"))
+    row2.append(InlineKeyboardButton("🏠 Меню", callback_data="main_menu_new"))
+    markup.add(*row2)
+    return markup
+
+
+def _run_growth_plan_worker(chat_id, user_id, photo_hash, scores_text, full_text, status_msg):
+    try:
+        report_context = f"{scores_text}\n\n{full_text}".strip()[:4500]
+        prompt = GROWTH_PLAN_PROMPT.format(report_context=report_context)
+        plan_text, _ = run_gemini_text_pipeline(prompt)
+        delete_status_safe(chat_id, status_msg)
+
+        if not plan_text:
+            bot.send_message(
+                chat_id,
+                "⏳ Не удалось сгенерировать план роста прямо сейчас — попробуй нажать кнопку через минуту.",
+            )
+            return
+
+        cache_set_growth_plan(photo_hash, plan_text)
+        send_long_html(chat_id, "📈 Персональный план роста (PRO)", plan_text)
+    except Exception as e:
+        log_error(f"Ошибка в _run_growth_plan_worker: {e}")
+        delete_status_safe(chat_id, status_msg)
+        bot.send_message(chat_id, "⏳ Технический сбой при генерации плана роста. Попробуй ещё раз.")
+    finally:
+        with _growth_busy_lock:
+            _growth_busy.discard((user_id, photo_hash))
+
+
+def _build_front_caption(scores_text, verdict="", limit_info="", delta_line=""):
+    score = extract_final_score(scores_text)
+    m_cat = re.search(r"(?im)^Категория[:\s]+(.+)$", scores_text)
+    cat = m_cat.group(1).strip() if m_cat else (category_by_score(score) if score else "")
+    head = (
+        f"<b>Результат: {score:.1f}/8 • {html.escape(cat)}</b>"
+        if score is not None
+        else "<b>Карточка анализа лица готова</b>"
+    )
+    delta_block = f"\n{html.escape(delta_line)}" if delta_line else ""
+    quote_block = f"\n<blockquote>{html.escape(verdict)}</blockquote>" if verdict else ""
+    return f"{head}{delta_block}{quote_block}{limit_info}"
+
+
+def _build_profile_caption(scores_text, verdict="", limit_info=""):
+    score = extract_final_score(scores_text)
+    m_cat = re.search(r"(?im)^Категория[:\s]+(.+)$", scores_text)
+    cat = m_cat.group(1).strip() if m_cat else (category_by_score(score) if score else "")
+    head = (
+        f"<b>📐 Профиль: {score:.1f}/8 • {html.escape(cat)}</b>"
+        if score is not None
+        else "<b>📐 Анализ бокового профиля готов</b>"
+    )
+    quote_block = f"\n<blockquote>{html.escape(verdict)}</blockquote>" if verdict else ""
+    return f"{head}{quote_block}{limit_info}"
+
+
+def _send_report_card_or_text(
+    chat_id,
+    card_bytes,
+    scores_text,
+    full_text,
+    photo_hash,
+    verdict="",
+    limit_info="",
+    delta_line="",
+    is_profile=False,
+    card_file_id="",
+):
+    markup = build_report_markup(
+        photo_hash if full_text else None,
+        include_profile_btn=not is_profile,
+        is_profile=is_profile,
+    )
+    if not verdict:
+        verdict = extract_verdict(scores_text)
+
+    caption = (
+        _build_profile_caption(scores_text, verdict=verdict, limit_info=limit_info)
+        if is_profile
+        else _build_front_caption(scores_text, verdict=verdict, limit_info=limit_info, delta_line=delta_line)
+    )
+
+    if card_file_id:
+        try:
+            bot.send_photo(chat_id, card_file_id, caption=caption, parse_mode="HTML", reply_markup=markup)
+            return card_file_id
+        except Exception as e:
+            log_error(f"Не удалось отправить карточку по file_id, пробую резерв: {e}")
+
+    if card_bytes:
+        try:
+            with io.BytesIO(card_bytes) as bio:
+                bio.name = "adonis_psl_card.jpg"
+                sent = bot.send_photo(chat_id, bio, caption=caption, parse_mode="HTML", reply_markup=markup)
+            if sent and getattr(sent, "photo", None):
+                return sent.photo[-1].file_id
+            return ""
+        except Exception as e:
+            log_error(f"Не удалось отправить карточку, шлю текстом: {e}")
+
+    title = "Анализ бокового профиля:" if is_profile else "Экспресс-оценка лица:"
+    delta_block = f"\n{html.escape(delta_line)}" if delta_line else ""
+    bot.send_message(
+        chat_id,
+        f"<b>{title}</b>{delta_block}\n\n<blockquote>{html.escape(scores_text)}</blockquote>{limit_info}",
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
+    return ""
+
+
+def _format_full_breakdown(full_text, geom=None):
+    parts = []
+    if geom and geom.get("metrics"):
+        title = "📐 Пропорции (468 точек лица):" if geom.get("source") == "mediapipe" else "📐 Пропорции лица:"
+        lines = [title]
+        for m in geom["metrics"]:
+            if m.get("display"):
+                lines.append(f"• {m['name']}: {m['display']} — {m['status']} ({m['norm']})")
+            else:
+                lines.append(f"• {m['name']}: {m['status']} ({m['norm']})")
+        lines.append(f"• Симметрия: {geom['symmetry_pct']:.1f}% — {geom['symmetry_status']}")
+        if geom.get("face_shape"):
+            lines.append(f"• Форма лица: {geom['face_shape']}")
+        parts.append("\n".join(lines))
+    if full_text:
+        parts.append(full_text.strip())
+    return "\n\n".join(parts)
+
+
+def _send_no_scans_prompt(chat_id, user_id=None):
+    has_sub_bonus = (
+        user_id is not None
+        and is_channel_bonus_enabled()
+        and not is_channel_bonus_claimed(user_id)
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    if has_sub_bonus:
+        markup.add(
+            InlineKeyboardButton(
+                f"📢 +{CHANNEL_SUB_BONUS} скан за подписку на канал",
+                callback_data="channel_bonus",
+            )
+        )
+    markup.add(InlineKeyboardButton(f"🤝 Пригласить друга (+{REFERRAL_BONUS} скан)", callback_data="get_ref"))
+    markup.add(InlineKeyboardButton("💎 Купить сканы / PRO", callback_data="buy_menu"))
+    markup.add(InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
+
+    if has_sub_bonus:
+        msg = (
+            "❌ <b>На балансе нет доступных сканов.</b>\n\n"
+            f"Подпишись на наш канал (+{CHANNEL_SUB_BONUS} бесплатный скан), "
+            f"пригласи друга (+{REFERRAL_BONUS} скан) или выбери тариф:"
+        )
+    else:
+        msg = (
+            "❌ <b>Бесплатные сканы исчерпаны.</b>\n\n"
+            f"Пригласи друга по ссылке (+{REFERRAL_BONUS} скан) или выбери тариф:"
+        )
+    bot.send_message(chat_id, msg, parse_mode="HTML", reply_markup=markup)
+
+
+def _send_pro_daily_limit_prompt(chat_id, daily_limit):
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("⚡ Докупить пакет сканов", callback_data="buy_menu"))
+    markup.add(InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
+    bot.send_message(
+        chat_id,
+        f"⏳ <b>Дневной лимит PRO исчерпан ({daily_limit}/{daily_limit}).</b>\n"
+        "Лимит обновится завтра в 00:00, либо можно докупить пакет дополнительных сканов:",
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
+
+
+def process_adult_photo(message, status_msg=None):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    free_limit, pro_tier, _, _ = get_user_access(user_id)
+    admin_user = is_admin(user_id)
+    daily_limit = get_pro_daily_limit_for_tier(pro_tier)
+
+    if not admin_user:
+        if pro_tier > 0:
+            if get_pro_remaining_today(user_id, pro_tier) <= 0 and free_limit <= 0:
+                delete_status_safe(chat_id, status_msg)
+                _send_pro_daily_limit_prompt(chat_id, daily_limit)
+                return
+        elif free_limit <= 0:
+            delete_status_safe(chat_id, status_msg)
+            _send_no_scans_prompt(chat_id, user_id=user_id)
+            return
+
+    try:
+        if not status_msg:
+            status_msg = send_status_safe(message, "⚡ Сканю пропорции лица...")
+        processed_bytes = download_and_process_photo(message)
+    except ValueError as val_err:
+        delete_status_safe(chat_id, status_msg)
+        bot.send_message(chat_id, f"⚠️ {val_err}")
+        return
+    except Exception as e:
+        delete_status_safe(chat_id, status_msg)
+        log_error(f"Ошибка скачивания фото: {e}")
+        bot.send_message(chat_id, "⏳ Не удалось скачать фото. Попробуй ещё раз.")
+        return
+
+    photo_hash = hashlib.sha256(CACHE_VERSION.encode("utf-8") + processed_bytes).hexdigest()[:32]
+    cached = cache_get(photo_hash)
+    if cached:
+        scores_text, full_text, card_bytes, card_file_id, _ = cached
+        delete_status_safe(chat_id, status_msg)
+        _send_report_card_or_text(
+            chat_id, card_bytes, scores_text, full_text, photo_hash,
+            is_profile=False, card_file_id=card_file_id,
+        )
+        return
+
+    consumed_mode = None
+    if not admin_user:
+        if pro_tier > 0:
+            if try_consume_pro_scan(user_id, daily_limit):
+                consumed_mode = "pro"
+            elif try_consume_extra_scan(user_id):
+                consumed_mode = "extra"
+            else:
+                delete_status_safe(chat_id, status_msg)
+                _send_pro_daily_limit_prompt(chat_id, daily_limit)
+                return
+        else:
+            if not try_consume_scan(user_id):
+                delete_status_safe(chat_id, status_msg)
+                _send_no_scans_prompt(chat_id, user_id=user_id)
+                return
+            consumed_mode = "free"
+
+    def refund_if_needed():
+        if consumed_mode in ("free", "extra"):
+            refund_scan(user_id)
+        elif consumed_mode == "pro":
+            refund_pro_scan(user_id)
+
+    scan_completed = False
+    try:
+        geom = analyze_face_geometry(processed_bytes)
+        prompt = build_adult_prompt(geom)
+        raw_response, api_errors = run_gemini_pipeline(processed_bytes, prompt)
+
+        if not raw_response:
+            refund_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, format_api_failure(api_errors), parse_mode="HTML")
+            return
+
+        scores_part, full_text = split_model_response(raw_response)
+        verdict = extract_verdict(scores_part)
+        if geom is None:
+            geom = extract_visual_geometry(scores_part)
+        scores_text, params_dict, final_score, category = normalize_adult_scores(scores_part)
+
+        if not scores_text:
+            refund_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, "🤔 Не удалось распознать лицо. Пришли чёткое фото анфас при хорошем свете.")
+            return
+
+        full_combined = _format_full_breakdown(full_text, geom=geom)
+        card_bytes = None
+        try:
+            card_bytes = render_front_report_card(
+                processed_bytes, params_dict or {}, final_score, category, verdict, geom,
+                bot_username=get_bot_username(),
+            )
+        except Exception as card_err:
+            log_error(f"Ошибка рендера карточки: {card_err}")
+
+        if consumed_mode == "free":
+            rem_limit, _, _, _ = get_user_access(user_id)
+            limit_info = (
+                "\n<i>Сканы закончились — пригласи друга (/ref) или пополни баланс (/buy).</i>"
+                if rem_limit == 0
+                else f"\n<i>Осталось сканов: {rem_limit}</i>"
+            )
+        elif consumed_mode == "extra":
+            rem_limit, _, _, _ = get_user_access(user_id)
+            limit_info = f"\n<i>Списан доп. скан из пакета (осталось доп.: {rem_limit})</i>"
+        elif consumed_mode == "pro":
+            pro_left = get_pro_remaining_today(user_id, pro_tier)
+            limit_info = f"\n<i>PRO-сканов на сегодня: {pro_left}/{daily_limit}</i>"
+        else:
+            limit_info = ""
+
+        delta_val = preview_score_delta(user_id, final_score)
+        delta_line = format_score_delta(delta_val)
+
+        delete_status_safe(chat_id, status_msg)
+        sent_file_id = _send_report_card_or_text(
+            chat_id, card_bytes, scores_text, full_combined, photo_hash,
+            verdict=verdict, limit_info=limit_info, delta_line=delta_line, is_profile=False,
+        )
+        scan_completed = True
+        cache_put(photo_hash, scores_text, full_combined, card_image=card_bytes, card_file_id=sent_file_id)
+        record_user_scan_stats(user_id, score=final_score)
+
+    except Exception as e:
+        log_error(f"Ошибка в process_adult_photo: {e}")
+        if not scan_completed:
+            refund_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, "⏳ Произошёл технический сбой. Попробуй ещё раз.")
+    finally:
+        gc.collect()
+
+
+def process_profile_photo(message, status_msg=None):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    def _keep_profile_markup():
+        set_awaiting_profile(user_id)
+        m = InlineKeyboardMarkup()
+        m.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_profile"))
+        return m
+
+    free_limit, pro_tier, _, _ = get_user_access(user_id)
+    admin_user = is_admin(user_id)
+    daily_limit = get_pro_daily_limit_for_tier(pro_tier)
+
+    if not admin_user:
+        if pro_tier <= 0:
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, "👑 Анализ бокового профиля доступен только с активным PRO (/buy).")
+            return
+        if get_pro_remaining_today(user_id, pro_tier) <= 0 and free_limit <= 0:
+            delete_status_safe(chat_id, status_msg)
+            _send_pro_daily_limit_prompt(chat_id, daily_limit)
+            return
+
+    try:
+        if not status_msg:
+            status_msg = send_status_safe(message, "📐 Анализирую структуру бокового профиля...")
+        processed_bytes = download_and_process_photo(message)
+    except ValueError as val_err:
+        delete_status_safe(chat_id, status_msg)
+        bot.send_message(
+            chat_id,
+            f"⚠️ {val_err}\nРежим профиля активен — отправь другое фото сбоку или нажми «Отмена».",
+            reply_markup=_keep_profile_markup(),
+        )
+        return
+    except Exception as e:
+        delete_status_safe(chat_id, status_msg)
+        log_error(f"Ошибка скачивания фото профиля: {e}")
+        bot.send_message(chat_id, "⏳ Не удалось скачать фото. Попробуй ещё раз.", reply_markup=_keep_profile_markup())
+        return
+
+    photo_hash = "p" + hashlib.sha256(PROFILE_CACHE_VERSION.encode("utf-8") + processed_bytes).hexdigest()[:31]
+    cached = cache_get(photo_hash)
+    if cached:
+        scores_text, full_text, card_bytes, card_file_id, _ = cached
+        delete_status_safe(chat_id, status_msg)
+        _send_report_card_or_text(
+            chat_id, card_bytes, scores_text, full_text, photo_hash,
+            is_profile=True, card_file_id=card_file_id,
+        )
+        return
+
+    consumed_mode = None
+    if not admin_user:
+        if try_consume_pro_scan(user_id, daily_limit):
+            consumed_mode = "pro"
+        elif try_consume_extra_scan(user_id):
+            consumed_mode = "extra"
+        else:
+            delete_status_safe(chat_id, status_msg)
+            _send_pro_daily_limit_prompt(chat_id, daily_limit)
+            return
+
+    def refund_profile_if_needed():
+        if consumed_mode == "pro":
+            refund_pro_scan(user_id)
+        elif consumed_mode == "extra":
+            refund_scan(user_id)
+
+    scan_completed = False
+    try:
+        raw_response, api_errors = run_gemini_pipeline(processed_bytes, PROFILE_RATING_PROMPT)
+        if not raw_response:
+            refund_profile_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, format_api_failure(api_errors), parse_mode="HTML", reply_markup=_keep_profile_markup())
+            return
+
+        profile_data, full_text = parse_profile_response(raw_response)
+        if not profile_data:
+            refund_profile_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(
+                chat_id,
+                "🤔 Не удалось распознать боковой профиль. Пришли чёткое фото строго сбоку (90°), чтобы была видна линия челюсти.\n\n"
+                "<i>Режим профиля остаётся активным — отправь следующее фото или нажми «Отмена».</i>",
+                parse_mode="HTML",
+                reply_markup=_keep_profile_markup(),
+            )
+            return
+
+        card_bytes = None
+        try:
+            card_bytes = render_profile_report_card(processed_bytes, profile_data, bot_username=get_bot_username())
+        except Exception as card_err:
+            log_error(f"Ошибка рендера карточки профиля: {card_err}")
+
+        if consumed_mode == "pro":
+            limit_info = f"\n<i>PRO-сканов на сегодня: {get_pro_remaining_today(user_id, pro_tier)}/{daily_limit}</i>"
+        elif consumed_mode == "extra":
+            rem_limit, _, _, _ = get_user_access(user_id)
+            limit_info = f"\n<i>Списан доп. скан из пакета (осталось доп.: {rem_limit})</i>"
+        else:
+            limit_info = ""
+
+        delete_status_safe(chat_id, status_msg)
+        sent_file_id = _send_report_card_or_text(
+            chat_id, card_bytes, profile_data["summary_text"], full_text, photo_hash,
+            verdict=profile_data.get("verdict", ""), limit_info=limit_info, is_profile=True,
+        )
+        scan_completed = True
+        cache_put(photo_hash, profile_data["summary_text"], full_text, card_image=card_bytes, card_file_id=sent_file_id)
+        record_user_scan_stats(user_id, score=None)
+
+    except Exception as e:
+        log_error(f"Ошибка в process_profile_photo: {e}")
+        if not scan_completed:
+            refund_profile_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, "⏳ Произошёл технический сбой. Попробуй ещё раз.")
+    finally:
+        gc.collect()
+
+
+def scan_worker_loop():
+    while True:
+        _, _, scan_type, message, status_msg = _scan_queue.get()
+        user_id = message.from_user.id
+        try:
+            if scan_type == "profile":
+                process_profile_photo(message, status_msg=status_msg)
+            else:
+                process_adult_photo(message, status_msg=status_msg)
+        except Exception as e:
+            log_error(f"Ошибка в scan_worker_loop: {e}")
+        finally:
+            release_user(user_id)
+            _scan_queue.task_done()
+
+
+def start_scan_workers():
+    for i in range(SCAN_WORKERS):
+        threading.Thread(target=scan_worker_loop, name=f"scan-worker-{i + 1}", daemon=True).start()
+
+
+def handle_receipt_submission(message, plan_id):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    plan = PLANS.get(plan_id)
+    if not plan:
+        bot.send_message(chat_id, "⚠️ Тариф не найден. Открой /buy заново.")
+        return
+
+    ok, err_msg = check_plan_allowed(user_id, plan)
+    if not ok:
+        bot.send_message(chat_id, f"⚠️ {err_msg}")
+        return
+
+    existing_req = get_pending_payment_request_id(user_id)
+    if existing_req:
+        bot.reply_to(
+            message,
+            f"⏳ У тебя уже есть нерассмотренная заявка <b>#{existing_req}</b>.\n"
+            "Дождись проверки администратором или напиши в /paysupport.",
+            parse_mode="HTML",
+        )
+        return
+
+    pricing = get_plan_pricing(plan_id, user_id=user_id)
+    req_id = create_payment_request(
+        user_id,
+        plan_id,
+        promo_code=pricing["promo_code"],
+        rub_amount=pricing["rub"],
+    )
+    username = f"@{message.from_user.username}" if message.from_user.username else "без юзернейма"
+    full_name = html.escape(message.from_user.first_name or "Пользователь")
+    promo_note = (
+        f"\nПромокод: <code>{html.escape(pricing['promo_code'])}</code> (-{pricing['discount_pct']}%)"
+        if pricing["promo_code"]
+        else ""
+    )
+
+    caption = (
+        f"💳 <b>Чек по заявке #{req_id}</b>\n\n"
+        f"Юзер: {full_name} ({html.escape(username)})\n"
+        f"ID: <code>{user_id}</code>\n"
+        f"Тариф: <b>{html.escape(plan['title'])}</b> ({pricing['rub']} ₽){promo_note}"
+    )
+
+    admin_markup = InlineKeyboardMarkup()
+    admin_markup.add(
+        InlineKeyboardButton("✅ Выдать доступ", callback_data=f"payok_{req_id}"),
+        InlineKeyboardButton("❌ Отклонить", callback_data=f"payno_{req_id}"),
+    )
+
+    sent_any = False
+    for admin_id in ADMIN_IDS:
+        try:
+            if message.photo:
+                bot.send_photo(admin_id, message.photo[-1].file_id, caption=caption, parse_mode="HTML", reply_markup=admin_markup)
+            elif message.document:
+                bot.send_document(admin_id, message.document.file_id, caption=caption, parse_mode="HTML", reply_markup=admin_markup)
+            sent_any = True
+        except Exception as e:
+            log_error(f"Не удалось отправить чек админу {admin_id}: {e}")
+
+    if sent_any:
+        bot.reply_to(
+            message,
+            f"✅ <b>Чек по заявке #{req_id} отправлен на проверку!</b>\n"
+            f"Тариф: <b>{html.escape(plan['title'])}</b>\n"
+            "После подтверждения доступ активируется автоматически.",
+            parse_mode="HTML",
+        )
+    else:
+        bot.reply_to(message, "⚠️ Не удалось отправить чек администратору. Нажми /paysupport.")
+
+
+@bot.message_handler(content_types=["photo", "document"])
+def handle_photo(message):
+    user_id = message.from_user.id
+    touch_user(message.from_user)
+    if is_user_banned(user_id):
+        bot.send_message(message.chat.id, "⛔ Доступ к боту ограничен.")
+        return
+
+    if is_admin(user_id) and _prepare_broadcast_preview(message):
+        return
+
+    if _is_duplicate_media_group(user_id, getattr(message, "media_group_id", None)):
+        return
+
+    if not check_rate_limit(user_id, "media", min_interval=2.5, max_per_min=10):
+        bot.reply_to(message, "⏳ Слишком частые запросы. Подожди пару секунд.")
+        return
+
+    pending_plan_id, receipt_expired = pop_awaiting_receipt(user_id)
+    if receipt_expired:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("💎 Открыть тарифы", callback_data="buy_menu"))
+        bot.send_message(
+            message.chat.id,
+            "⏳ <b>Время ожидания чека истекло (30 мин).</b>\n"
+            "Чтобы отправить чек, выбери тариф заново через меню ниже — фото не отправлено на скан.",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return
+
+    if pending_plan_id:
+        if message.content_type == "document" and not is_receipt_document(message):
+            set_awaiting_receipt(user_id, pending_plan_id)
+            bot.send_message(message.chat.id, "⚠️ Пришли скриншот чека (фото или PDF-файл).")
+            return
+        handle_receipt_submission(message, pending_plan_id)
+        return
+
+    is_profile_mode, profile_expired = pop_awaiting_profile(user_id)
+    if profile_expired:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("📐 Включить режим профиля", callback_data="profile_scan"))
+        bot.send_message(
+            message.chat.id,
+            "⏳ <b>Режим анализа бокового профиля истёк (30 мин).</b>\n"
+            "Нажми кнопку ниже и отправь фото заново, чтобы оно не пошло как скан анфас.",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return
+
+    if message.content_type == "document" and not is_image_document(message):
+        if is_profile_mode:
+            set_awaiting_profile(user_id)
+        bot.send_message(message.chat.id, "Пришли фото или изображение (JPG/PNG/WEBP).")
+        return
+
+    if not acquire_user(user_id):
+        if is_profile_mode:
+            set_awaiting_profile(user_id)
+        bot.send_message(message.chat.id, "⏳ Предыдущее фото ещё обрабатывается — подожди пару секунд.")
+        return
+
+    try:
+        _, pro_tier, _, is_adult = get_user_access(user_id)
+        if not is_adult and not is_admin(user_id):
+            release_user(user_id)
+            if is_profile_mode:
+                set_awaiting_profile(user_id)
+            send_adult_confirm(message.chat.id)
+            return
+
+        if not is_admin(user_id) and pro_tier <= 0 and _scan_queue.qsize() >= MAX_SCAN_QUEUE_SIZE:
+            release_user(user_id)
+            if is_profile_mode:
+                set_awaiting_profile(user_id)
+            bot.send_message(message.chat.id, "⏳ Очередь переполнена. Попробуй отправить фото через минуту.")
+            return
+
+        scan_type = "profile" if is_profile_mode else "front"
+        front_label = "Сканю пропорции по 468 точкам" if is_mediapipe_available() else "Сканю пропорции лица"
+
+        if is_admin(user_id) or pro_tier >= 2:
+            priority = 0
+            status_text = "📐 Анализирую боковой профиль (топ-приоритет)..." if is_profile_mode else f"⚡ {front_label} (топ-приоритет)..."
+        elif pro_tier == 1:
+            priority = 1
+            status_text = "📐 Анализирую боковой профиль (PRO-приоритет)..." if is_profile_mode else f"⚡ {front_label} (PRO-приоритет)..."
+        else:
+            priority = 2
+            status_text = "⏳ Фото добавлено в очередь..." if _scan_queue.qsize() >= SCAN_WORKERS else f"⚡ {front_label}..."
+
+        status_msg = send_status_safe(message, status_text)
+        _scan_queue.put((priority, next(_scan_seq), scan_type, message, status_msg))
+    except Exception as e:
+        release_user(user_id)
+        if is_profile_mode:
+            set_awaiting_profile(user_id)
+        log_error(f"Ошибка постановки фото в очередь: {e}")
+        bot.send_message(message.chat.id, "⏳ Произошла ошибка при обработке фото. Попробуй ещё раз.")
+
+
+def check_plan_allowed(user_id, plan):
+    if plan["type"] in ("pro30", "pro_life"):
+        _, pro_tier, _, _ = get_user_access(user_id)
+        if pro_tier >= 2:
+            return False, "У тебя уже активен PRO Навсегда!"
+    return True, None
+
+
+@bot.pre_checkout_query_handler(func=lambda query: True)
+def handle_pre_checkout(pre_checkout_query):
+    user_id = pre_checkout_query.from_user.id
+    if is_user_banned(user_id):
+        bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Доступ ограничен.")
+        return
+
+    payload = pre_checkout_query.invoice_payload or ""
+    parts = payload.split(":")
+    if len(parts) in (3, 4) and parts[0] == "plan" and parts[1] in PLANS and parts[2] == str(user_id):
+        plan_id = parts[1]
+        plan = PLANS[plan_id]
+        promo_code = parts[3].strip().upper() if len(parts) == 4 else ""
+
+        if promo_code:
+            pct = validate_discount_promo_for_user(user_id, promo_code)
+            if pct <= 0:
+                bot.answer_pre_checkout_query(
+                    pre_checkout_query.id,
+                    ok=False,
+                    error_message="Промокод истёк, исчерпан или уже привязан к заявке. Открой /buy заново.",
+                )
+                return
+            expected_stars = calc_discounted_price(plan["stars"], pct)
+        else:
+            expected_stars = plan["stars"]
+
+        if pre_checkout_query.currency != "XTR" or pre_checkout_query.total_amount != expected_stars:
+            bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Сумма платежа не совпадает.")
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message=err_msg or "Тариф недоступен.")
+            return
+        bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+    else:
+        bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Тариф не найден.")
+
+
+@bot.message_handler(content_types=["successful_payment"])
+def handle_successful_payment(message):
+    sp = message.successful_payment
+    user_id = message.from_user.id
+    parts = (sp.invoice_payload or "").split(":")
+    if len(parts) not in (3, 4) or parts[0] != "plan" or parts[1] not in PLANS or parts[2] != str(user_id):
+        log_error(f"Некорректный successful_payment payload от {user_id}: {sp.invoice_payload}")
+        return
+
+    plan_id = parts[1]
+    plan = PLANS[plan_id]
+    promo_code = parts[3].strip().upper() if len(parts) == 4 else ""
+
+    if promo_code:
+        pct = get_promo_discount_value_raw(promo_code)
+        expected_stars = calc_discounted_price(plan["stars"], pct) if pct > 0 else -1
+    else:
+        expected_stars = plan["stars"]
+
+    if sp.currency != "XTR" or sp.total_amount != expected_stars:
+        log_error(
+            f"Несовпадение суммы Stars от {user_id}: {sp.total_amount} {sp.currency} != {expected_stars} XTR"
+        )
+        return
+
+    if not record_stars_payment(sp.telegram_payment_charge_id, user_id, plan_id, sp.total_amount):
+        return
+
+    if promo_code:
+        consume_discount_promo(user_id, promo_code)
+
+    apply_plan_to_user(user_id, plan_id)
+    bot.send_message(
+        message.chat.id,
+        f"✅ <b>Оплата прошла успешно!</b>\nАктивировано: <b>{html.escape(plan['title'])}</b>.",
+        parse_mode="HTML",
+    )
+
+    username = f"@{message.from_user.username}" if message.from_user.username else "без юзернейма"
+    promo_str = f" (промокод {html.escape(promo_code)})" if promo_code else ""
+    for admin_id in ADMIN_IDS:
+        try:
+            bot.send_message(
+                admin_id,
+                f"⭐ <b>Оплата Telegram Stars</b>\n"
+                f"Юзер: <code>{user_id}</code> ({html.escape(username)})\n"
+                f"Тариф: {html.escape(plan['title'])} — <b>{sp.total_amount} ⭐</b>{promo_str}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    if not call.message:
+        safe_answer(call.id)
+        return
+
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
+    is_text_msg = call.message.content_type == "text"
+    edit_id = msg_id if is_text_msg else None
+
+    touch_user(call.from_user)
+    if is_user_banned(user_id):
+        safe_answer(call.id, "Доступ ограничен.", show_alert=True)
+        return
+
+    if not check_rate_limit(user_id, "cb", min_interval=0.4, max_per_min=35):
+        safe_answer(call.id, "Не так быстро 🙂")
+        return
+
+    data = call.data or ""
+
+    if data == "confirm_18":
+        set_user_adult(user_id)
+        safe_answer(call.id, "Возраст подтверждён")
+        try:
+            bot.edit_message_text("✅ Доступ открыт. Отправь фото лица анфас для анализа.", chat_id, msg_id)
+        except Exception:
+            bot.send_message(chat_id, "✅ Доступ открыт. Отправь фото лица анфас для анализа.")
+
+    elif data == "main_menu":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_main_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "main_menu_new":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_main_menu_view(user_id)
+        bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+
+    elif data == "psl_scale":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_psl_scale_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "psl_scale_new":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_psl_scale_view()
+        bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+
+    elif data == "scan_front_tip":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text = (
+            "<b>📸 Анализ лица анфас</b>\n\n"
+            "<blockquote>• Смотри прямо в камеру без наклона головы\n"
+            "• Ровный фронтальный свет, без жёстких теней\n"
+            "• Нейтральное выражение лица, без фильтров и очков</blockquote>\n\n"
+            "Просто отправь фото прямо сюда в чат."
+        )
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("📖 Шкала PSL", callback_data="psl_scale"))
+        markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "my_profile":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_profile_cabinet_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "buy_menu":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_buy_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "enter_promo":
+        clear_pending_modes(user_id)
+        set_awaiting_promo(user_id)
+        safe_answer(call.id, "Введи промокод")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_promo"))
+        edit_or_send(
+            chat_id,
+            "🎁 <b>Активация промокода</b>\n\n"
+            "Отправь промокод следующим сообщением в чат (например: <code>ADONIS</code>).",
+            reply_markup=markup,
+            message_id=edit_id,
+        )
+
+    elif data == "cancel_promo":
+        clear_awaiting_promo(user_id)
+        safe_answer(call.id, "Отменено")
+        text, markup = build_main_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "channel_bonus":
+        clear_pending_modes(user_id)
+        if not is_channel_bonus_enabled():
+            safe_answer(call.id, "Бонус пока недоступен.", show_alert=True)
+            return
+        if is_channel_bonus_claimed(user_id):
+            safe_answer(call.id, "Ты уже получил бонус за подписку!", show_alert=True)
+            return
+        safe_answer(call.id)
+        text, markup = build_channel_bonus_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "check_sub":
+        if not is_channel_bonus_enabled():
+            safe_answer(call.id, "Канал не настроен.", show_alert=True)
+            return
+        if is_channel_bonus_claimed(user_id):
+            safe_answer(call.id, "Бонус уже получен!", show_alert=True)
+            return
+        try:
+            member = bot.get_chat_member(get_channel_chat_id(), user_id)
+            is_sub = getattr(member, "status", "") in ("member", "administrator", "creator")
+        except Exception as e:
+            log_error(f"Ошибка проверки подписки на {CHANNEL_ID}: {e}")
+            safe_answer(call.id, "Не удалось проверить подписку. Попробуй позже.", show_alert=True)
+            return
+
+        if not is_sub:
+            safe_answer(call.id, "Подписка не найдена. Сначала подпишись на канал!", show_alert=True)
+            return
+
+        if claim_channel_bonus(user_id):
+            safe_answer(call.id, f"+{CHANNEL_SUB_BONUS} скан начислен!", show_alert=True)
+            text, markup = build_main_menu_view(user_id)
+            edit_or_send(
+                chat_id,
+                f"🎉 <b>Спасибо за подписку!</b> Начислено <b>+{CHANNEL_SUB_BONUS} бесплатный скан</b>.\n\n{text}",
+                reply_markup=markup,
+                message_id=edit_id,
+            )
+        else:
+            safe_answer(call.id, "Бонус уже был выдан ранее.", show_alert=True)
+
+    elif data == "get_ref":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_ref_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "support_menu":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_support_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "profile_scan":
+        clear_pending_modes(user_id)
+        _, pro_tier, _, _ = get_user_access(user_id)
+        if pro_tier <= 0 and not is_admin(user_id):
+            safe_answer(call.id, "Доступно в PRO")
+            markup = InlineKeyboardMarkup(row_width=1)
+            markup.add(InlineKeyboardButton("👑 Подключить PRO", callback_data="buy_menu"))
+            markup.add(InlineKeyboardButton("🤝 Получить PRO за друзей", callback_data="get_ref"))
+            markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+            text = (
+                "<b>📐 Анализ бокового профиля (PRO)</b>\n\n"
+                "<blockquote>Структурная карточка по 6 ключевым параметрам:\n"
+                "• Проекция подбородка и максиллы\n"
+                "• Чёткость угла челюсти\n"
+                "• Шейно-подбородочный угол\n"
+                "• Профиль носа и общая гармония</blockquote>\n\n"
+                "Открывается на тарифах <b>PRO 30 дней</b> и <b>PRO Навсегда</b>."
+            )
+            edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+            return
+
+        set_awaiting_profile(user_id)
+        safe_answer(call.id, "Отправь фото в профиль")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_profile"))
+        text = (
+            "<b>📐 Режим анализа бокового профиля</b>\n\n"
+            "<blockquote>Отправь чёткое фото строго <b>сбоку (90°)</b> при хорошем свете, "
+            "чтобы была видна линия челюсти, подбородок и профиль носа.</blockquote>"
+        )
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "cancel_profile":
+        clear_awaiting_profile(user_id)
+        safe_answer(call.id, "Режим профиля отменён")
+        text, markup = build_main_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "cancel_pay":
+        clear_pending_modes(user_id)
+        safe_answer(call.id, "Оплата отменена")
+        text, markup = build_main_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data.startswith("plan_"):
+        clear_pending_modes(user_id)
+        plan_id = data[5:]
+        plan = PLANS.get(plan_id)
+        if not plan:
+            safe_answer(call.id, "Тариф не найден.", show_alert=True)
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            safe_answer(call.id, err_msg, show_alert=True)
+            return
+
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        safe_answer(call.id)
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton(f"⭐ Оплатить {pr['stars']} Stars (мгновенно)", callback_data=f"stars_{plan_id}"))
+        if PAYMENT_CARD:
+            markup.add(InlineKeyboardButton(f"💳 Перевод на карту (только РФ) — {pr['rub']} ₽", callback_data=f"card_{plan_id}"))
+        markup.add(InlineKeyboardButton("⬅️ К тарифам", callback_data="buy_menu"))
+
+        promo_info = (
+            f"\n🎁 Промокод <code>{html.escape(pr['promo_code'])}</code>: скидка <b>-{pr['discount_pct']}%</b> "
+            f"(<s>{pr['orig_stars']} ⭐</s> → <b>{pr['stars']} ⭐</b> | <s>{pr['orig_rub']} ₽</s> → <b>{pr['rub']} ₽</b>)"
+            if pr["promo_code"]
+            else ""
+        )
+        text = (
+            f"<b>{html.escape(plan['title'])}</b>\n\n"
+            f"<blockquote>{html.escape(plan['desc'])}{promo_info}</blockquote>\n\n"
+            "Выбери удобный способ оплаты:"
+        )
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data.startswith("stars_"):
+        clear_pending_modes(user_id)
+        plan_id = data[6:]
+        plan = PLANS.get(plan_id)
+        if not plan:
+            safe_answer(call.id, "Тариф не найден.", show_alert=True)
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            safe_answer(call.id, err_msg, show_alert=True)
+            return
+
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        inv_payload = (
+            f"plan:{plan_id}:{user_id}:{pr['promo_code']}"
+            if pr["promo_code"]
+            else f"plan:{plan_id}:{user_id}"
+        )
+        desc = (
+            f"{plan['desc']} (промокод {pr['promo_code']} -{pr['discount_pct']}%)"
+            if pr["promo_code"]
+            else plan["desc"]
+        )
+        safe_answer(call.id, "Открываю счёт...")
+        try:
+            bot.send_invoice(
+                chat_id=chat_id,
+                title=plan["title"],
+                description=desc,
+                invoice_payload=inv_payload,
+                provider_token="",
+                currency="XTR",
+                prices=[LabeledPrice(label=plan["title"], amount=pr["stars"])],
+            )
+        except Exception as e:
+            log_error(f"Ошибка выставления счёта Stars: {e}")
+            bot.send_message(chat_id, "⚠️ Не удалось создать счёт Stars. Попробуй позже или выбери карту.")
+
+    elif data.startswith("card_"):
+        clear_pending_modes(user_id)
+        plan_id = data[5:]
+        plan = PLANS.get(plan_id)
+        if not plan or not PAYMENT_CARD:
+            safe_answer(call.id, "Оплата картой временно недоступна.", show_alert=True)
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            safe_answer(call.id, err_msg, show_alert=True)
+            return
+
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        safe_answer(call.id)
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("✅ Я оплатил — отправить чек", callback_data=f"paid_{plan_id}"))
+        markup.add(InlineKeyboardButton("⬅️ К тарифам", callback_data="buy_menu"))
+
+        sum_str = (
+            f"<s>{pr['orig_rub']} ₽</s> <b>{pr['rub']} ₽</b> (промокод {html.escape(pr['promo_code'])} -{pr['discount_pct']}%)"
+            if pr["promo_code"]
+            else f"<b>{pr['rub']} ₽</b>"
+        )
+        text = (
+            f"<b>💳 Оплата картой (только РФ): {html.escape(plan['title'])}</b>\n\n"
+            f"<blockquote>Сумма: {sum_str}\n"
+            f"Банк: <b>{html.escape(PAYMENT_BANK)}</b>\n"
+            f"Карта: <code>{html.escape(PAYMENT_CARD)}</code></blockquote>\n\n"
+            "После перевода нажми кнопку ниже и отправь чек."
+        )
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data.startswith("paid_"):
+        plan_id = data[5:]
+        plan = PLANS.get(plan_id)
+        if not plan or not PAYMENT_CARD:
+            safe_answer(call.id, "Оплата картой временно недоступна.", show_alert=True)
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            safe_answer(call.id, err_msg, show_alert=True)
+            return
+        existing_req = get_pending_payment_request_id(user_id)
+        if existing_req:
+            safe_answer(call.id, f"Заявка #{existing_req} ещё на проверке.", show_alert=True)
+            return
+
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        set_awaiting_receipt(user_id, plan_id)
+        safe_answer(call.id, "Отправь скриншот или PDF-чек")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_pay"))
+        text = (
+            f"📸 <b>Отправь скриншот или PDF-чек</b> об оплате "
+            f"<b>{html.escape(plan['title'])}</b> ({pr['rub']} ₽) прямо сюда в чат."
+        )
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data.startswith("payok_") or data.startswith("payno_"):
+        if not is_admin(user_id):
+            safe_answer(call.id, "Нет прав.", show_alert=True)
+            return
+        is_approve = data.startswith("payok_")
+        try:
+            req_id = int(data.split("_", 1)[1])
+        except ValueError:
+            safe_answer(call.id, "Некорректная заявка.", show_alert=True)
+            return
+
+        resolved = resolve_payment_request(req_id, "approved" if is_approve else "rejected")
+        if not resolved:
+            safe_answer(call.id, "Заявка уже обработана.", show_alert=True)
+            return
+
+        target_id, plan_id, req_promo, _ = resolved
+        plan = PLANS.get(plan_id)
+
+        if is_approve and plan:
+            if req_promo:
+                consume_discount_promo(target_id, req_promo)
+            apply_plan_to_user(target_id, plan_id)
+            safe_answer(call.id, "Доступ выдан!")
+            status_suffix = "\n\n✅ <b>Доступ выдан</b>"
+            try:
+                bot.send_message(
+                    target_id,
+                    f"✅ <b>Оплата подтверждена!</b>\nАктивировано: <b>{html.escape(plan['title'])}</b>.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        else:
+            safe_answer(call.id, "Заявка отклонена.")
+            status_suffix = "\n\n❌ <b>Отклонено</b>"
+            try:
+                bot.send_message(target_id, f"❌ Заявка на оплату #{req_id} отклонена администратором.")
+            except Exception:
+                pass
+
+        try:
+            if call.message.content_type in ("photo", "document"):
+                base_cap = call.message.html_caption or html.escape(call.message.caption or "")
+                bot.edit_message_caption(base_cap + status_suffix, chat_id, msg_id, parse_mode="HTML", reply_markup=None)
+            else:
+                base_txt = call.message.html_text or html.escape(call.message.text or "")
+                bot.edit_message_text(base_txt + status_suffix, chat_id, msg_id, parse_mode="HTML", reply_markup=None)
+        except Exception:
+            try:
+                bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
+            except Exception:
+                pass
+
+    elif data.startswith("setmodel_"):
+        if not is_admin(user_id):
+            safe_answer(call.id, "Нет прав.", show_alert=True)
+            return
+        clear_awaiting_model(user_id)
+        chosen = data[9:].strip()
+        parsed = parse_models_input(chosen)
+        if not parsed:
+            safe_answer(call.id, "Некорректная модель.", show_alert=True)
+            return
+        set_active_models(parsed)
+        safe_answer(call.id, f"Установлена {parsed[0]}")
+        text, markup = build_model_manager_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "model_custom":
+        if not is_admin(user_id):
+            safe_answer(call.id, "Нет прав.", show_alert=True)
+            return
+        clear_pending_modes(user_id)
+        set_awaiting_model(user_id)
+        safe_answer(call.id, "Отправь название модели")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="model_cancel"))
+        edit_or_send(
+            chat_id,
+            "✏️ <b>Ввод своей модели Gemini</b>\n\n"
+            "Отправь следующим сообщением точное название модели (например: "
+            "<code>gemini-3.5-flash-lite</code>) или несколько через запятую.",
+            reply_markup=markup,
+            message_id=edit_id,
+        )
+
+    elif data == "model_cancel":
+        if not is_admin(user_id):
+            safe_answer(call.id)
+            return
+        clear_awaiting_model(user_id)
+        safe_answer(call.id, "Отменено")
+        text, markup = build_model_manager_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "model_reset_cd":
+        if not is_admin(user_id):
+            safe_answer(call.id, "Нет прав.", show_alert=True)
+            return
+        reset_model_cooldowns()
+        safe_answer(call.id, "Паузы 404/429 сброшены!", show_alert=True)
+
+    elif data == "bc_cancel":
+        if not is_admin(user_id):
+            safe_answer(call.id)
+            return
+        clear_broadcast_state(user_id)
+        safe_answer(call.id, "Рассылка отменена")
+        try:
+            bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
+        except Exception:
+            pass
+        bot.send_message(chat_id, "❌ Рассылка отменена.")
+
+    elif data == "bc_send":
+        if not is_admin(user_id):
+            safe_answer(call.id)
+            return
+        with _broadcast_lock:
+            payload = _broadcast_state.pop(user_id, None)
+        if not payload or payload.get("step") != "ready":
+            safe_answer(call.id, "Нет активного черновика.", show_alert=True)
+            return
+        safe_answer(call.id, "Запускаю рассылку...")
+        try:
+            bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
+        except Exception:
+            pass
+        bot.send_message(chat_id, "🚀 Рассылка запущена в фоне...")
+        threading.Thread(target=_run_broadcast_worker, args=(chat_id, payload), daemon=True).start()
+
+    elif data.startswith("full_"):
+        photo_hash = data[5:]
+        if not re.fullmatch(r"p?[0-9a-f]{31,32}", photo_hash):
+            safe_answer(call.id, "Некорректный идентификатор отчёта.", show_alert=True)
+            return
+        cached = cache_get(photo_hash)
+        if cached and cached[1]:
+            safe_answer(call.id, "Загружаю разбор...")
+            title = "📐 Разбор бокового профиля" if photo_hash.startswith("p") else "💬 Подробный разбор"
+            send_long_html(chat_id, title, cached[1])
+        else:
+            safe_answer(call.id, "Разбор устарел, отправь фото заново.", show_alert=True)
+
+    elif data.startswith("growth_"):
+        photo_hash = data[7:]
+        if not re.fullmatch(r"[0-9a-f]{32}", photo_hash):
+            safe_answer(call.id, "Некорректный идентификатор отчёта.", show_alert=True)
+            return
+
+        _, pro_tier, _, _ = get_user_access(user_id)
+        if pro_tier <= 0 and not is_admin(user_id):
+            safe_answer(call.id, "Доступно в PRO")
+            markup = InlineKeyboardMarkup(row_width=1)
+            markup.add(InlineKeyboardButton("👑 Подключить PRO", callback_data="buy_menu"))
+            markup.add(InlineKeyboardButton("🤝 Получить PRO за друзей", callback_data="get_ref"))
+            bot.send_message(
+                chat_id,
+                "<b>📈 Персональный план роста (PRO)</b>\n\n"
+                "<blockquote>По результатам твоего скана бот составит пошаговый план:\n"
+                "• Топ-3 зоны роста с максимальным эффектом\n"
+                "• Подбор стрижки и щетины строго под твою форму лица\n"
+                "• Чек-лист по коже, бровям, отёчности и грумингу на 30 дней</blockquote>\n\n"
+                "Открывается на тарифах <b>PRO</b> или бесплатно за 3 приглашённых друзей.",
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+            return
+
+        cached = cache_get(photo_hash)
+        if not cached:
+            safe_answer(call.id, "Отчёт устарел, отправь фото заново.", show_alert=True)
+            return
+
+        scores_text, full_text, _, _, growth_plan = cached
+        if growth_plan:
+            safe_answer(call.id, "Загружаю план роста...")
+            send_long_html(chat_id, "📈 Персональный план роста (PRO)", growth_plan)
+            return
+
+        busy_key = (user_id, photo_hash)
+        with _growth_busy_lock:
+            if busy_key in _growth_busy:
+                safe_answer(call.id, "План уже составляется, подожди пару секунд...")
+                return
+            _growth_busy.add(busy_key)
+
+        safe_answer(call.id, "Составляю персональный план...")
+        status_msg = bot.send_message(chat_id, "📈 Составляю персональный план роста по твоим метрикам...")
+        threading.Thread(
+            target=_run_growth_plan_worker,
+            args=(chat_id, user_id, photo_hash, scores_text, full_text, status_msg),
+            daemon=True,
+        ).start()
+
+    else:
+        safe_answer(call.id)
+
+
+@bot.message_handler(content_types=["text"])
+def handle_fallback_text(message):
+    user_id = message.from_user.id
+    touch_user(message.from_user)
+    if is_user_banned(user_id):
+        return
+
+    if is_awaiting_promo(user_id):
+        clear_awaiting_promo(user_id)
+        ok, ptype, msg_text = activate_promocode_for_user(user_id, message.text)
+        markup = InlineKeyboardMarkup(row_width=1)
+        if ok and ptype == "discount":
+            markup.add(InlineKeyboardButton("💎 Перейти к тарифам со скидкой", callback_data="buy_menu"))
+        elif not ok:
+            markup.add(InlineKeyboardButton("🔁 Попробовать другой код", callback_data="enter_promo"))
+        markup.add(InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
+        bot.reply_to(message, msg_text, parse_mode="HTML", reply_markup=markup)
+        return
+
+    if is_awaiting_receipt(user_id):
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_pay"))
+        bot.reply_to(
+            message,
+            "📸 Жду <b>скриншот или PDF-чек</b> об оплате. Пришли его фото/файлом или нажми «Отмена».",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+    elif is_awaiting_profile(user_id):
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_profile"))
+        bot.reply_to(
+            message,
+            "📐 Сейчас активен режим <b>бокового профиля</b>. Пришли фото сбоку (90°) или нажми «Отмена».",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+
+
+if __name__ == "__main__":
+    init_db()
+    ensure_user_columns()
+    load_active_models_from_db()
+    setup_bot_commands()
+    start_scan_workers()
+    is_mediapipe_available()
+    uname = get_bot_username()
+    print(f"🚀 Adonis PSL Bot (@{uname or 'unknown'}) запущен!")
+
+    while True:
+        try:
+            bot.infinity_polling(
+                timeout=30,
+                long_polling_timeout=25,
+                skip_pending=True,
+            )
+        except KeyboardInterrupt:
+            print("🛑 Бот остановлен вручную.")
+            break
+        except Exception as e:
+            log_error(f"Сбой polling, перезапуск через 5 сек: {e}")
+            time.sleep(5)_media_group_lock = threading.Lock()
+_seen_media_groups = {}
+
+
+def _is_duplicate_media_group(user_id, media_group_id):
+    if not media_group_id:
+        return False
+    now = time.time()
+    key = (user_id, str(media_group_id))
+    with _media_group_lock:
+        if len(_seen_media_groups) > 500:
+            cutoff = now - 60.0
+            stale = [k for k, ts in _seen_media_groups.items() if ts < cutoff]
+            for k in stale:
+                del _seen_media_groups[k]
+        if key in _seen_media_groups and (now - _seen_media_groups[key]) < 30.0:
+            return True
+        _seen_media_groups[key] = now
+        return False
+
+
+def send_status_safe(message, text):
+    try:
+        return bot.reply_to(message, text)
+    except Exception:
+        try:
+            return bot.send_message(message.chat.id, text)
+        except Exception as e:
+            log_error(f"Не удалось отправить статус: {e}")
+            return None
+
+
+def delete_status_safe(chat_id, status_msg):
+    if not status_msg:
+        return
+    try:
+        bot.delete_message(chat_id, status_msg.message_id)
+    except Exception:
+        pass
+
+
+def safe_answer(call_id, text=None, show_alert=False):
+    try:
+        bot.answer_callback_query(call_id, text, show_alert=show_alert)
+    except Exception as e:
+        log_error(f"answer_callback_query: {e}")
+
+
+def edit_or_send(chat_id, text, reply_markup=None, message_id=None, parse_mode="HTML"):
+    if message_id:
+        try:
+            bot.edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=message_id,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+            return
+        except Exception as e:
+            if "message is not modified" in str(e).lower():
+                return
+    bot.send_message(
+        chat_id,
+        text,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True,
+    )
+
+
+def send_long_html(chat_id, title, text, limit=3500):
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if current and len(current) + len(line) + 1 > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
+
+    for i, chunk in enumerate(chunks):
+        header = f"<b>{html.escape(title)}</b>\n\n" if i == 0 else ""
+        try:
+            bot.send_message(chat_id, header + html.escape(chunk), parse_mode="HTML")
+        except Exception:
+            plain = f"{title}\n\n{chunk}" if i == 0 else chunk
+            bot.send_message(chat_id, plain, parse_mode=None)
+
+
+def is_image_document(message):
+    doc = getattr(message, "document", None)
+    if not doc:
+        return False
+    mime = (doc.mime_type or "").lower()
+    fname = (doc.file_name or "").lower()
+    return mime.startswith("image/") or fname.endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp"))
+
+
+def is_receipt_document(message):
+    if is_image_document(message):
+        return True
+    doc = getattr(message, "document", None)
+    if not doc:
+        return False
+    mime = (doc.mime_type or "").lower()
+    fname = (doc.file_name or "").lower()
+    return mime == "application/pdf" or fname.endswith(".pdf")
+
+
+def download_and_process_photo(message):
+    if message.photo:
+        file_obj = message.photo[-1]
+    elif message.document:
+        file_obj = message.document
+    else:
+        raise ValueError("Пришли фото лица.")
+
+    if (getattr(file_obj, "file_size", 0) or 0) > MAX_IMAGE_FILE_SIZE:
+        raise ValueError("Файл слишком большой (максимум 15 МБ).")
+
+    file_info = bot.get_file(file_obj.file_id)
+    if (file_info.file_size or 0) > MAX_IMAGE_FILE_SIZE:
+        raise ValueError("Файл слишком большой (максимум 15 МБ).")
+
+    raw_bytes = bot.download_file(file_info.file_path)
+    try:
+        with io.BytesIO(raw_bytes) as in_buf, Image.open(in_buf) as img:
+            img = ImageOps.exif_transpose(img)
+            if img.width < 64 or img.height < 64:
+                raise ValueError("Изображение слишком маленькое. Пришли чёткое фото лица.")
+            rgb = img.convert("RGB")
+            rgb.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+            with io.BytesIO() as out_buf:
+                rgb.save(out_buf, format="JPEG", quality=90, optimize=True)
+                return out_buf.getvalue()
+    except ValueError:
+        raise
+    except Image.DecompressionBombError:
+        raise ValueError("Изображение имеет слишком высокое разрешение.")
+    except Exception:
+        raise ValueError("Не удалось прочитать изображение. Пришли обычный JPG или PNG.")
+
+
+def setup_bot_commands():
+    default_commands = [
+        BotCommand("start", "Главное меню"),
+        BotCommand("buy", "Тарифы и сканы"),
+        BotCommand("ref", "Пригласить друга (+1 скан)"),
+        BotCommand("scale", "Шкала PSL 1.0–8.0"),
+        BotCommand("paysupport", "Поддержка"),
+    ]
+    admin_commands = default_commands + [
+        BotCommand("admin", "Шпаргалка по админке"),
+        BotCommand("model", "Сменить модель Gemini"),
+    ]
+    try:
+        bot.set_my_commands(default_commands, scope=BotCommandScopeDefault())
+        for admin_id in ADMIN_IDS:
+            bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
+    except Exception as e:
+        log_error(f"Не удалось выставить меню команд: {e}")
+
+
+def format_user_status_short(user_id):
+    free_limit, pro_tier, pro_until, _ = get_user_access(user_id)
+    if is_admin(user_id):
+        return "👑 <b>Администратор</b> • без лимитов"
+    extra_str = f" (+{free_limit} доп.)" if free_limit > 0 else ""
+    if pro_tier >= 2:
+        left = get_pro_remaining_today(user_id, pro_tier)
+        return f"💎 <b>PRO Навсегда</b> • сегодня {left}/{PRO_LIFE_DAILY_LIMIT}{extra_str}"
+    if pro_tier == 1:
+        left = get_pro_remaining_today(user_id, pro_tier)
+        until_str = format_date_from_ts(pro_until) if pro_until > 0 else "—"
+        return f"👑 <b>PRO до {until_str}</b> • сегодня {left}/{PRO30_DAILY_LIMIT}{extra_str}"
+    return f"⚡ <b>Базовый</b> • доступно сканов: <b>{free_limit}</b>"
+
+
+def format_score_delta(delta):
+    if delta is None:
+        return ""
+    if delta > 0.05:
+        return f"📈 +{delta:.1f} к прошлому скану"
+    if delta < -0.05:
+        return f"📉 {delta:.1f} к прошлому скану"
+    return "➖ без изменений к прошлому скану"
+
+
+def preview_score_delta(user_id, new_score):
+    if new_score is None:
+        return None
+    _, best_score, _, _, _, _, last_score, _ = get_user_profile_stats(user_id)
+    ref_score = last_score if last_score > 0.0 else best_score
+    if ref_score <= 0.0:
+        return None
+    return round(float(new_score) - float(ref_score), 1)
+
+
+def build_main_menu_view(user_id):
+    free_limit, pro_tier, _, _ = get_user_access(user_id)
+    status_line = format_user_status_short(user_id)
+    scans_cnt, best_score, _, _, _, _, last_score, prev_score = get_user_profile_stats(user_id)
+    best_line = f" • Лучший балл: <b>{best_score:.1f}/8</b>" if best_score > 0 else ""
+    delta_line = ""
+    if last_score > 0 and prev_score > 0:
+        d_txt = format_score_delta(round(last_score - prev_score, 1))
+        if d_txt:
+            delta_line = f"\nПоследний скан: <b>{last_score:.1f}/8</b> ({d_txt})"
+
+    sub_hint = ""
+    if (
+        not is_admin(user_id)
+        and pro_tier == 0
+        and free_limit <= 0
+        and is_channel_bonus_enabled()
+        and not is_channel_bonus_claimed(user_id)
+    ):
+        sub_hint = (
+            f"\n\n🎁 <b>Получи +{CHANNEL_SUB_BONUS} бесплатный скан:</b> "
+            "подпишись на наш канал кнопкой ниже!"
+        )
+
+    text = (
+        "<b>ADONIS PSL • Биометрия лица</b>\n\n"
+        f"<blockquote>{status_line}\n"
+        f"Сканов выполнено: <b>{scans_cnt}</b>{best_line}{delta_line}</blockquote>\n\n"
+        "Просто отправь <b>фото анфас</b> при ровном свете — бот замерит пропорции "
+        f"и соберёт карточку-отчёт по шкале 1.0–8.0.{sub_hint}"
+    )
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("📸 Анализ анфас", callback_data="scan_front_tip"),
+        InlineKeyboardButton("📐 Профиль (PRO)", callback_data="profile_scan"),
+    )
+    markup.add(
+        InlineKeyboardButton("👤 Мой профиль", callback_data="my_profile"),
+        InlineKeyboardButton("💎 Тарифы и сканы", callback_data="buy_menu"),
+    )
+    markup.add(
+        InlineKeyboardButton("🤝 Пригласить друга", callback_data="get_ref"),
+        InlineKeyboardButton("📖 Шкала PSL", callback_data="psl_scale"),
+    )
+    if is_channel_bonus_enabled() and not is_channel_bonus_claimed(user_id):
+        markup.add(
+            InlineKeyboardButton(
+                f"📢 +{CHANNEL_SUB_BONUS} скан за подписку",
+                callback_data="channel_bonus",
+            ),
+            InlineKeyboardButton("🆘 Поддержка", callback_data="support_menu"),
+        )
+    else:
+        markup.add(InlineKeyboardButton("🆘 Поддержка", callback_data="support_menu"))
+    return text, markup
+
+
+def build_psl_scale_view():
+    text = (
+        "<b>📖 Шкала PSL (1.0–8.0)</b>\n\n"
+        "<blockquote>"
+        "• <b>1.0–2.4</b> — <b>Саб 3</b> <i>(нижние ~5%)</i>\n"
+        "• <b>2.5–2.9</b> — <b>Саб 5</b> <i>(ниже среднего)</i>\n"
+        "• <b>3.0–3.4</b> — <b>Лтн</b> <i>(нижняя граница нормы)</i>\n"
+        "• <b>3.5–3.9</b> — <b>Мтн</b> <i>(средняя норма, ~50-й процентиль)</i>\n"
+        "• <b>4.0–4.4</b> — <b>Мхтн</b> <i>(выше среднего)</i>\n"
+        "• <b>4.5–4.9</b> — <b>Хмтн</b> <i>(верхние ~20%)</i>\n"
+        "• <b>5.0–5.4</b> — <b>Хтн</b> <i>(верхние ~10%)</i>\n"
+        "• <b>5.5–6.4</b> — <b>Лоу чад лайт</b> <i>(модельный уровень, топ ~3%)</i>\n"
+        "• <b>6.5–6.9</b> — <b>Чад лайт</b> <i>(сильный модельный, топ ~1%)</i>\n"
+        "• <b>7.0–8.0</b> — <b>Чад</b> <i>(элитный мировой уровень, топ &lt;0.2%)</i>"
+        "</blockquote>\n\n"
+        "<b>📸 Как получить точный замер:</b>\n"
+        "• Основная камера на уровне глаз с расстояния ~1–1.5 м (без широкоугольных искажений)\n"
+        "• Ровный фронтальный дневной свет, нейтральное лицо, без фильтров и очков"
+    )
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("📸 Сделать скан", callback_data="scan_front_tip"),
+        InlineKeyboardButton("👤 Мой профиль", callback_data="my_profile"),
+    )
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def build_profile_cabinet_view(user_id):
+    status_line = format_user_status_short(user_id)
+    scans_cnt, best_score, ref_count, _, _, _, last_score, prev_score = get_user_profile_stats(user_id)
+    best_str = f"<b>{best_score:.1f}/8</b> ({category_by_score(best_score)})" if best_score > 0 else "ещё нет"
+
+    last_line = ""
+    if last_score > 0:
+        delta_txt = format_score_delta(round(last_score - prev_score, 1)) if prev_score > 0 else ""
+        delta_part = f" • {delta_txt}" if delta_txt else ""
+        last_line = f"\nПоследний скан: <b>{last_score:.1f}/8</b>{delta_part}"
+
+    promo_code, discount_pct = get_user_active_discount(user_id)
+    promo_line = (
+        f"\nАктивный промокод: <code>{html.escape(promo_code)}</code> (<b>-{discount_pct}%</b>)"
+        if promo_code
+        else ""
+    )
+
+    uname = get_bot_username()
+    ref_block = (
+        f"\n🔗 Реф-ссылка:\n<code>https://t.me/{uname}?start=ref_{user_id}</code>"
+        if uname
+        else ""
+    )
+
+    text = (
+        "<b>👤 Мой профиль</b>\n\n"
+        f"<blockquote>{status_line}\n"
+        f"ID: <code>{user_id}</code>\n"
+        f"Всего сканов: <b>{scans_cnt}</b>\n"
+        f"Лучший результат: {best_str}{last_line}\n"
+        f"Приглашено друзей: <b>{ref_count}</b>{promo_line}</blockquote>"
+        f"{ref_block}"
+    )
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("💎 Пополнить / PRO", callback_data="buy_menu"),
+        InlineKeyboardButton("🎁 Промокод", callback_data="enter_promo"),
+    )
+    markup.add(
+        InlineKeyboardButton("🤝 Рефералка", callback_data="get_ref"),
+        InlineKeyboardButton("📖 Шкала PSL", callback_data="psl_scale"),
+    )
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def build_buy_menu_view(user_id=None):
+    promo_code, discount_pct = get_user_active_discount(user_id) if user_id is not None else ("", 0)
+    promo_banner = (
+        f"🎁 <b>Активна скидка -{discount_pct}%</b> по промокоду <code>{html.escape(promo_code)}</code>!\n\n"
+        if promo_code
+        else ""
+    )
+
+    lines = []
+    for plan_id, plan in PLANS.items():
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        if pr["discount_pct"] > 0:
+            price_txt = (
+                f"<s>{pr['orig_stars']} ⭐</s> <b>{pr['stars']} ⭐</b> / "
+                f"<s>{pr['orig_rub']} ₽</s> <b>{pr['rub']} ₽</b>"
+            )
+        else:
+            price_txt = f"{pr['stars']} ⭐ / {pr['rub']} ₽"
+
+        if plan_id == "pack15":
+            lines.append(f"• <b>{html.escape(plan['title'])}</b> — {price_txt} <i>(выгоднее)</i>")
+        elif plan_id == "pro30":
+            lines.append(
+                f"• <b>{html.escape(plan['title'])}</b> — {price_txt}\n"
+                f"  <i>{PRO30_DAILY_LIMIT} сканов/день + профиль + план роста + приоритет</i>"
+            )
+        elif plan_id == "pro_life":
+            lines.append(
+                f"• <b>{html.escape(plan['title'])}</b> — {price_txt}\n"
+                f"  <i>{PRO_LIFE_DAILY_LIMIT} сканов/день + профиль + план роста + топ-приоритет</i>"
+            )
+        else:
+            lines.append(f"• <b>{html.escape(plan['title'])}</b> — {price_txt}")
+
+    text = (
+        "<b>💎 Тарифы и сканы</b>\n\n"
+        f"{promo_banner}"
+        "<blockquote>" + "\n".join(lines) + "</blockquote>\n\n"
+        "Оплата через <b>Telegram Stars</b> активируется мгновенно."
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    for plan_id, plan in PLANS.items():
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        disc_tag = f" (-{pr['discount_pct']}%)" if pr["discount_pct"] > 0 else ""
+        markup.add(
+            InlineKeyboardButton(
+                f"{plan['title']} — {pr['stars']} ⭐ / {pr['rub']} ₽{disc_tag}",
+                callback_data=f"plan_{plan_id}",
+            )
+        )
+    markup.add(InlineKeyboardButton("🎁 Ввести промокод", callback_data="enter_promo"))
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def _build_progress_bar(current, target, width=10):
+    ratio = max(0.0, min(1.0, current / max(1, target)))
+    filled = int(round(ratio * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+def build_ref_view(user_id):
+    username = get_bot_username()
+    if not username:
+        return "⏳ Не удалось сформировать ссылку. Попробуй через пару секунд.", InlineKeyboardMarkup()
+
+    _, _, ref_count, _, _, _, _, _ = get_user_profile_stats(user_id)
+    ref_link = f"https://t.me/{username}?start=ref_{user_id}"
+    share_text = "Оцени внешность по 8-балльной шкале в Adonis PSL:"
+    share_url = f"https://t.me/share/url?url={quote(ref_link)}&text={quote(share_text)}"
+
+    ladder_lines = []
+    next_target = None
+    for req_refs, pro_days in REF_MILESTONES:
+        if ref_count >= req_refs:
+            ladder_lines.append(f"✅ <b>{req_refs} друзей</b> → PRO на {pro_days} дн.")
+        else:
+            if next_target is None:
+                next_target = (req_refs, pro_days)
+            ladder_lines.append(f"🔒 <b>{req_refs} друзей</b> → PRO на {pro_days} дн.")
+
+    if next_target:
+        req_refs, pro_days = next_target
+        bar = _build_progress_bar(ref_count, req_refs, width=10)
+        left = req_refs - ref_count
+        progress_txt = (
+            f"\nДо <b>PRO на {pro_days} дн.</b>: <code>[{bar}]</code> "
+            f"<b>{ref_count}/{req_refs}</b> (осталось {left})"
+        )
+    else:
+        progress_txt = "\n🏆 <b>Все ступени реферальной лестницы пройдены!</b>"
+
+    text = (
+        "<b>🤝 Пригласить друга</b>\n\n"
+        f"<blockquote>За каждого нового пользователя по твоей ссылке начисляется "
+        f"<b>+{REFERRAL_BONUS} бесплатный скан</b>.\n"
+        f"Приглашено друзей: <b>{ref_count}</b>{progress_txt}</blockquote>\n\n"
+        "<b>🏆 Реферальная лестница:</b>\n"
+        + "\n".join(ladder_lines)
+        + f"\n\nТвоя ссылка (нажми, чтобы скопировать):\n<code>{html.escape(ref_link)}</code>"
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("📤 Поделиться ссылкой", url=share_url))
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def build_channel_bonus_view():
+    url = get_channel_url()
+    text = (
+        f"<b>📢 Бонус +{CHANNEL_SUB_BONUS} бесплатный скан</b>\n\n"
+        "<blockquote>Подпишись на наш официальный Telegram-канал с обновлениями, разборами и промокодами, "
+        "затем нажми кнопку проверки ниже.</blockquote>"
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    if url:
+        markup.add(InlineKeyboardButton("📣 Перейти в канал", url=url))
+    markup.add(InlineKeyboardButton("✅ Проверить подписку", callback_data="check_sub"))
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def build_support_view():
+    support_url = get_support_url()
+    text = (
+        "<b>🆘 Поддержка</b>\n\n"
+        "<blockquote>Оплата через Telegram Stars начисляется автоматически за 1 секунду. "
+        "Перевод на карту (только РФ) подтверждается администратором после проверки чека.</blockquote>\n\n"
+        "Если возник вопрос по оплате или работе бота — напиши напрямую администратору:"
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    if support_url:
+        markup.add(InlineKeyboardButton("💬 Написать администратору", url=support_url))
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def send_adult_confirm(chat_id):
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("✅ Мне есть 18 лет", callback_data="confirm_18"))
+    bot.send_message(
+        chat_id,
+        "Доступ к оценке внешности разрешён только пользователям 18+.\n"
+        "Подтверди свой возраст кнопкой ниже:",
+        reply_markup=markup,
+    )
+
+
+def parse_referrer_id(text):
+    parts = (text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    m = re.match(r"^ref_(\d+)$", parts[1].strip())
+    return int(m.group(1)) if m else None
+
+
+def parse_start_promo(text):
+    parts = (text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    m = re.match(r"^promo_([A-Za-z0-9_\-]{2,24})$", parts[1].strip())
+    return m.group(1).upper() if m else None
+
+
+@bot.message_handler(commands=["start"])
+def cmd_start(message):
+    user_id = message.from_user.id
+    clear_pending_modes(user_id)
+    if is_user_banned(user_id):
+        bot.send_message(message.chat.id, "⛔ Доступ к боту ограничен.")
+        return
+    if not check_rate_limit(user_id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+
+    referrer_id = parse_referrer_id(message.text)
+    start_promo = parse_start_promo(message.text)
+    rewarded_referrer, milestone_msg = register_user_if_new(message.from_user, referrer_id=referrer_id)
+    if rewarded_referrer:
+        try:
+            ref_notice = (
+                f"🎉 По твоей ссылке присоединился новый пользователь!\n"
+                f"Начислен бонус: <b>+{REFERRAL_BONUS} бесплатный скан</b>."
+            )
+            if milestone_msg:
+                ref_notice += f"\n\n{milestone_msg}"
+            bot.send_message(rewarded_referrer, ref_notice, parse_mode="HTML")
+        except Exception as e:
+            log_error(f"Не удалось уведомить реферера {rewarded_referrer}: {e}")
+
+    if start_promo:
+        _, _, promo_msg = activate_promocode_for_user(user_id, start_promo)
+        bot.send_message(message.chat.id, promo_msg, parse_mode="HTML")
+
+    _, _, _, is_adult = get_user_access(user_id)
+    text, markup = build_main_menu_view(user_id)
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+    if not is_adult and not is_admin(user_id):
+        send_adult_confirm(message.chat.id)
+
+
+@bot.message_handler(commands=["buy"])
+def cmd_buy(message):
+    touch_user(message.from_user)
+    if is_user_banned(message.from_user.id):
+        return
+    if not check_rate_limit(message.from_user.id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+    clear_pending_modes(message.from_user.id)
+    text, markup = build_buy_menu_view(message.from_user.id)
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.message_handler(commands=["ref"])
+def cmd_ref(message):
+    touch_user(message.from_user)
+    if is_user_banned(message.from_user.id):
+        return
+    if not check_rate_limit(message.from_user.id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+    clear_pending_modes(message.from_user.id)
+    text, markup = build_ref_view(message.from_user.id)
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.message_handler(commands=["scale"])
+def cmd_scale(message):
+    touch_user(message.from_user)
+    if is_user_banned(message.from_user.id):
+        return
+    if not check_rate_limit(message.from_user.id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+    clear_pending_modes(message.from_user.id)
+    text, markup = build_psl_scale_view()
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.message_handler(commands=["paysupport"])
+def cmd_paysupport(message):
+    touch_user(message.from_user)
+    if is_user_banned(message.from_user.id):
+        return
+    if not check_rate_limit(message.from_user.id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+    clear_pending_modes(message.from_user.id)
+    text, markup = build_support_view()
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+
+def get_admin_help_text():
+    return (
+        "<b>👑 Админ-команды (через точку)</b>\n\n"
+        "<blockquote>"
+        "• <code>. создать промокод 10% ADONIS 50 24ч</code> — создать промо\n"
+        "  <i>Награда: 10% / 2скана / 3pro | лимит и время (30м/24ч/7д) опц.</i>\n"
+        "• <code>. промокоды</code> — список промокодов и активаций\n"
+        "• <code>. удалить промокод ADONIS</code> — отключить промокод\n"
+        "• <code>. выдать всем 1</code> — выдать +N сканов всем пользователям\n"
+        "• <code>. забрать у всех 1</code> / <code>все</code> — списать N (или все) сканы у всех\n"
+        "• <code>. забрать стартовый</code> — забрать 1 неиспользованный старт-скан у новичков\n"
+        "• <code>. выдать сканы @user 10</code> / <code>. забрать сканы @user 5</code>\n"
+        "• <code>. выдать премиум @user 30</code> / <code>навсегда</code>\n"
+        "• <code>. забрать премиум @user</code> — снять PRO\n"
+        "• <code>. модель</code> — меню смены модели Gemini (или <code>. модель имя</code>)\n"
+        "• <code>. стата</code> — сводка по боту (+ сканы за сегодня)\n"
+        "• <code>. юзеры [15]</code> — последние пользователи и их активность\n"
+        "• <code>. инфо @user</code> — досье по юзеру\n"
+        "• <code>. рассылка</code> — рассылка с предпросмотром\n"
+        "• <code>. бан @user</code> / <code>. разбан @user</code>\n"
+        "• <code>. очистить кэш</code> — сбросить кэш фото\n"
+        "• <code>. админ</code> — эта шпаргалка"
+        "</blockquote>\n\n"
+        "Вместо <code>@user</code> можно указывать числовой <code>ID</code>."
+    )
+
+
+def build_model_manager_view():
+    active = get_active_models()
+    active_str = "\n".join(f"• <code>{html.escape(m)}</code>" for m in active)
+    text = (
+        "<b>🤖 Управление моделью Gemini</b>\n\n"
+        f"<blockquote>Активная сейчас:\n{active_str}</blockquote>\n\n"
+        "Выбери быстрый пресет кнопкой ниже, введи свою модель вручную "
+        "или напиши команду:\n"
+        "<code>. модель gemini-3.5-flash-lite</code>\n"
+        "<i>Можно указать несколько через запятую (запасной фолбэк).</i>"
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    for preset in PRESET_MODELS:
+        prefix = "✅ " if active == [preset] else ""
+        markup.add(InlineKeyboardButton(f"{prefix}{preset}", callback_data=f"setmodel_{preset}"))
+    markup.add(InlineKeyboardButton("✏️ Ввести свою модель", callback_data="model_custom"))
+    markup.add(InlineKeyboardButton("🔄 Сбросить паузу 404/429", callback_data="model_reset_cd"))
+    markup.add(InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
+    return text, markup
+
+
+def get_bot_stats_text():
+    now = int(time.time())
+    today = get_today_str()
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        total = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE date(created_at, 'localtime') = ?", (today,))
+        new_today = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(pro_tier, 0) = 1 AND pro_until > ?", (now,))
+        pro30_cnt = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(pro_tier, 0) >= 2")
+        pro_life_cnt = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(is_banned, 0) = 1")
+        banned_cnt = c.fetchone()[0]
+        c.execute("SELECT COALESCE(SUM(scans_count), 0), COALESCE(SUM(referrals_count), 0) FROM users")
+        total_scans, total_refs = c.fetchone()
+        c.execute("SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM stars_payments")
+        stars_cnt, stars_sum = c.fetchone()
+        c.execute("SELECT COUNT(*) FROM payment_requests WHERE status = 'approved'")
+        card_cnt = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM photo_cache")
+        cached = c.fetchone()[0]
+        c.execute("SELECT COALESCE(scans, 0) FROM daily_stats WHERE day = ?", (today,))
+        row_today = c.fetchone()
+        scans_today = row_today[0] if row_today else 0
+        c.execute(
+            """
+            SELECT COUNT(*) FROM promocodes
+            WHERE is_active = 1
+              AND (expires_at = 0 OR expires_at > ?)
+              AND (max_uses = 0 OR used_count < max_uses)
+            """,
+            (now,),
+        )
+        active_promos = c.fetchone()[0]
+
+    mp_status = "✅ активен" if is_mediapipe_available() else "⚠️ визуальный режим"
+    models_str = ", ".join(get_active_models())
+    return (
+        "<b>📊 Статистика ADONIS PSL</b>\n\n"
+        "<blockquote>"
+        f"Пользователей: <b>{total}</b> (новых сегодня: <b>+{new_today}</b>)\n"
+        f"PRO 30д: <b>{pro30_cnt}</b> | PRO Навсегда: <b>{pro_life_cnt}</b> | Бан: <b>{banned_cnt}</b>\n"
+        f"Всего сканов: <b>{total_scans}</b> (сегодня: <b>+{scans_today}</b>) | Рефералов: <b>{total_refs}</b>\n"
+        f"Stars: <b>{stars_cnt}</b> ({stars_sum} ⭐) | Картой: <b>{card_cnt}</b>\n"
+        f"Очередь: <b>{_scan_queue.qsize()}</b> | Кэш фото: <b>{cached}</b> | Промо: <b>{active_promos}</b>\n"
+        f"Модели: <code>{html.escape(models_str)}</code>\n"
+        f"MediaPipe 468 точек: <b>{mp_status}</b>"
+        "</blockquote>"
+    )
+
+
+def build_user_dossier_text(target_id):
+    free_limit, pro_tier, pro_until, is_adult = get_user_access(target_id)
+    scans_cnt, best_score, ref_count, uname, fname, banned, last_score, prev_score = get_user_profile_stats(target_id)
+
+    extra_str = f" + {free_limit} доп." if free_limit > 0 else ""
+    if pro_tier >= 2:
+        tier_str = f"💎 PRO Навсегда (сегодня {get_pro_remaining_today(target_id, pro_tier)}/{PRO_LIFE_DAILY_LIMIT}{extra_str})"
+    elif pro_tier == 1:
+        tier_str = f"👑 PRO до {format_date_from_ts(pro_until)} (сегодня {get_pro_remaining_today(target_id, pro_tier)}/{PRO30_DAILY_LIMIT}{extra_str})"
+    else:
+        tier_str = f"⚡ Базовый (сканов: {free_limit})"
+
+    uname_str = f"@{uname}" if uname else "нет"
+    ban_str = "⛔ Забанен" if banned else "✅ Активен"
+    best_str = f"{best_score:.1f}/8" if best_score > 0 else "—"
+    last_str = f"{last_score:.1f}/8" if last_score > 0 else "—"
+    if last_score > 0 and prev_score > 0:
+        d = round(last_score - prev_score, 1)
+        last_str += f" ({d:+.1f})"
+
+    return (
+        f"<b>🗂 Досье пользователя</b>\n\n"
+        "<blockquote>"
+        f"ID: <code>{target_id}</code>\n"
+        f"Username: {html.escape(uname_str)}\n"
+        f"Имя: {html.escape(fname or '—')}\n"
+        f"Статус: {ban_str} | 18+: {'да' if is_adult else 'нет'}\n"
+        f"Тариф: {tier_str}\n"
+        f"Сканов всего: <b>{scans_cnt}</b> | Лучший: <b>{best_str}</b> | Последний: <b>{last_str}</b>\n"
+        f"Рефералов: <b>{ref_count}</b>"
+        "</blockquote>"
+    )
+
+
+@bot.message_handler(commands=["admin"])
+def cmd_admin_slash(message):
+    if is_admin(message.from_user.id):
+        bot.reply_to(message, get_admin_help_text(), parse_mode="HTML")
+
+
+@bot.message_handler(commands=["model", "models"])
+def cmd_model_slash(message):
+    if not is_admin(message.from_user.id):
+        return
+    clear_pending_modes(message.from_user.id)
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 2 and parts[1].strip():
+        arg = parts[1].strip()
+        if arg.lower() in ("сброс", "reset", "default"):
+            saved = set_active_models(DEFAULT_MODELS)
+            bot.reply_to(
+                message,
+                f"✅ Модель сброшена на стандартную: <code>{html.escape(', '.join(saved))}</code>",
+                parse_mode="HTML",
+            )
+            return
+        parsed = parse_models_input(arg)
+        if not parsed:
+            bot.reply_to(
+                message,
+                "⚠️ Некорректное имя модели. Пример: <code>/model gemini-3.5-flash-lite</code>",
+                parse_mode="HTML",
+            )
+            return
+        saved = set_active_models(parsed)
+        bot.reply_to(
+            message,
+            f"✅ Активная модель обновлена:\n<code>{html.escape(', '.join(saved))}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    text, markup = build_model_manager_view()
+    bot.reply_to(message, text, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.message_handler(commands=["stats"])
+def cmd_stats_slash(message):
+    if is_admin(message.from_user.id):
+        bot.reply_to(message, get_bot_stats_text(), parse_mode="HTML")
+
+
+@bot.message_handler(commands=["clear_cache"])
+def cmd_clear_cache_slash(message):
+    if not is_admin(message.from_user.id):
+        return
+    with db_conn() as conn:
+        conn.cursor().execute("DELETE FROM photo_cache")
+    bot.reply_to(message, "✅ Кэш фото очищен.")
+
+
+@bot.message_handler(
+    func=lambda m: bool(
+        m.text
+        and m.text.lstrip().startswith(".")
+        and is_admin(m.from_user.id)
+        and not is_awaiting_broadcast(m.from_user.id)
+        and not is_awaiting_model(m.from_user.id)
+        and not is_awaiting_promo(m.from_user.id)
+    ),
+    content_types=["text"],
+)
+def handle_admin_dot_commands(message):
+    user_id = message.from_user.id
+    body = re.sub(r"\s+", " ", message.text.lstrip()[1:].strip())
+    low = body.lower()
+
+    if low in ("админ", "admin", "помощь", "help"):
+        bot.reply_to(message, get_admin_help_text(), parse_mode="HTML")
+        return
+
+    if low in ("стата", "статистика", "stats"):
+        bot.reply_to(message, get_bot_stats_text(), parse_mode="HTML")
+        return
+
+    m_users = re.match(r"^(?:юзеры|пользователи|users)(?:\s+(\d+))?$", body, flags=re.IGNORECASE)
+    if m_users:
+        lim = max(1, min(30, int(m_users.group(1)))) if m_users.group(1) else 15
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                """
+                SELECT user_id, COALESCE(username, ''), COALESCE(first_name, ''),
+                       COALESCE(free_limit, 0), COALESCE(pro_tier, 0),
+                       COALESCE(scans_count, 0), COALESCE(best_score, 0.0)
+                FROM users
+                ORDER BY created_at DESC, user_id DESC
+                LIMIT ?
+                """,
+                (lim,),
+            )
+            rows = c.fetchall()
+        if not rows:
+            bot.reply_to(message, "Пользователей пока нет.")
+            return
+        lines = []
+        for uid, uname, fname, flim, ptier, scnt, bscore in rows:
+            tag = f"@{uname}" if uname else (fname or str(uid))
+            tier_icon = "💎" if ptier >= 2 else ("👑" if ptier == 1 else "⚡")
+            score_part = f" | max {bscore:.1f}" if bscore > 0 else ""
+            lines.append(
+                f"{tier_icon} <code>{uid}</code> ({html.escape(tag[:20])}) — "
+                f"баланс: <b>{flim}</b> | сканов: <b>{scnt}</b>{score_part}"
+            )
+        bot.reply_to(
+            message,
+            f"<b>👥 Последние {len(rows)} пользователей</b>\n\n<blockquote>" + "\n".join(lines) + "</blockquote>",
+            parse_mode="HTML",
+        )
+        return
+
+    m_give_all = re.match(
+        r"^выдать\s+всем(?:\s+(?:сканы|сканов|рейты|рейтов))?\s+(\d+)$",
+        body,
+        flags=re.IGNORECASE,
+    )
+    if m_give_all:
+        amount = int(m_give_all.group(1))
+        if amount <= 0 or amount > 1000:
+            bot.reply_to(message, "⚠️ Укажи число от 1 до 1000.")
+            return
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                "UPDATE users SET free_limit = free_limit + ? WHERE COALESCE(is_banned, 0) = 0",
+                (amount,),
+            )
+            affected = c.rowcount
+        bot.reply_to(
+            message,
+            f"✅ Выдано <b>+{amount} сканов</b> всем активным пользователям (затронуто: <b>{affected}</b>).",
+            parse_mode="HTML",
+        )
+        return
+
+    m_take_all = re.match(
+        r"^(?:забрать\s+у\s+всех|списать\s+у\s+всех)(?:\s+(?:сканы|сканов|рейты|рейтов))?\s+(\S+)$",
+        body,
+        flags=re.IGNORECASE,
+    )
+    if m_take_all:
+        arg = m_take_all.group(1).lower()
+        if arg in ("все", "всё", "all", "0"):
+            with db_conn() as conn:
+                c = conn.cursor()
+                c.execute("UPDATE users SET free_limit = 0 WHERE free_limit > 0")
+                affected = c.rowcount
+            bot.reply_to(
+                message,
+                f"🗑 Все сканы (free_limit) обнулены у <b>{affected}</b> пользователей.",
+                parse_mode="HTML",
+            )
+            return
+        if not arg.isdigit() or int(arg) <= 0:
+            bot.reply_to(
+                message,
+                "⚠️ Укажи число (> 0) или слово <code>все</code>. Пример: <code>. забрать у всех 1</code>",
+                parse_mode="HTML",
+            )
+            return
+        amount = int(arg)
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                "UPDATE users SET free_limit = MAX(0, free_limit - ?) WHERE free_limit > 0",
+                (amount,),
+            )
+            affected = c.rowcount
+        bot.reply_to(
+            message,
+            f"✅ Списано до <b>-{amount} сканов</b> у всех пользователей с балансом (затронуто: <b>{affected}</b>).",
+            parse_mode="HTML",
+        )
+        return
+
+    if low in ("забрать стартовый", "снять стартовый"):
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                """
+                UPDATE users
+                SET free_limit = MAX(0, free_limit - 1)
+                WHERE free_limit > 0
+                  AND COALESCE(scans_count, 0) = 0
+                  AND COALESCE(pro_tier, 0) = 0
+                  AND COALESCE(channel_bonus_claimed, 0) = 0
+                  AND COALESCE(referrals_count, 0) = 0
+                """
+            )
+            affected = c.rowcount
+        bot.reply_to(
+            message,
+            f"✅ Неиспользованный стартовый скан списан у <b>{affected}</b> новичков "
+            "(подписчики ТГК, реферальные и купленные сканы не затронуты).",
+            parse_mode="HTML",
+        )
+        return
+
+    if low in ("очистить кэш", "кэш", "clear_cache"):
+        with db_conn() as conn:
+            conn.cursor().execute("DELETE FROM photo_cache")
+        bot.reply_to(message, "✅ Кэш фото очищен.")
+        return
+
+    if low in ("промокоды", "промо", "promos"):
+        rows = list_promocodes_db(limit=25)
+        if not rows:
+            bot.reply_to(
+                message,
+                "🎁 Промокодов пока нет.\n"
+                "Создать: <code>. создать промокод 10% ADONIS 50 24ч</code>",
+                parse_mode="HTML",
+            )
+            return
+        now = int(time.time())
+        lines = []
+        for code, ptype, val, max_u, used_c, exp_at, is_act in rows:
+            expired = bool(exp_at > 0 and now >= exp_at)
+            exhausted = bool(max_u > 0 and used_c >= max_u)
+            icon = "✅" if (is_act and not expired and not exhausted) else "⛔"
+            lim_str = f"{used_c}/{max_u}" if max_u > 0 else f"{used_c}/∞"
+            time_str = format_time_left(exp_at)
+            lines.append(
+                f"{icon} <code>{html.escape(code)}</code> — {format_promo_reward(ptype, val)} "
+                f"| {lim_str} | {time_str}"
+            )
+        bot.reply_to(
+            message,
+            "<b>🎁 Промокоды</b>\n\n<blockquote>" + "\n".join(lines) + "</blockquote>",
+            parse_mode="HTML",
+        )
+        return
+
+    m_del_promo = re.match(r"^(?:удалить|отключить)\s+промокод\s+(\S+)$", body, flags=re.IGNORECASE)
+    if m_del_promo:
+        code = m_del_promo.group(1).strip().upper()
+        if deactivate_promocode_db(code):
+            bot.reply_to(message, f"🗑 Промокод <code>{html.escape(code)}</code> отключён.", parse_mode="HTML")
+        else:
+            bot.reply_to(message, f"⚠️ Промокод <code>{html.escape(code)}</code> не найден.", parse_mode="HTML")
+        return
+
+    m_new_promo = re.match(r"^создать\s+промокод\s+(.+)$", body, flags=re.IGNORECASE)
+    if m_new_promo:
+        tokens = m_new_promo.group(1).strip().split()
+        if len(tokens) < 2:
+            bot.reply_to(
+                message,
+                "⚠️ Формат: <code>. создать промокод 10% ADONIS [лимит] [время]</code>\n"
+                "Примеры:\n"
+                "• <code>. создать промокод 10% ADONIS 50 24ч</code>\n"
+                "• <code>. создать промокод 2скана START 100 7д</code>\n"
+                "• <code>. создать промокод 3pro VIP 20</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        ptype, pval = parse_promo_reward_token(tokens[0])
+        if not ptype:
+            bot.reply_to(
+                message,
+                "⚠️ Некорректная награда. Укажи: <code>10%</code> (1–90%), <code>2скана</code> или <code>3pro</code>.",
+                parse_mode="HTML",
+            )
+            return
+
+        code = tokens[1].strip().upper()
+        if not re.fullmatch(r"[A-Z0-9_\-]{2,24}", code):
+            bot.reply_to(
+                message,
+                "⚠️ Код должен быть длиной 2–24 символа (только латиница, цифры, _ или -).",
+                parse_mode="HTML",
+            )
+            return
+
+        max_uses = 0
+        duration_sec = 0
+        for extra in tokens[2:]:
+            if extra.isdigit():
+                max_uses = int(extra)
+                continue
+            parsed_dur = parse_promo_duration_token(extra)
+            if parsed_dur is not None:
+                duration_sec = parsed_dur
+                continue
+            bot.reply_to(
+                message,
+                f"⚠️ Не понял параметр <code>{html.escape(extra)}</code>.\n"
+                "Лимит — число (например <code>50</code>), время — <code>30м</code>, <code>24ч</code> или <code>7д</code>.",
+                parse_mode="HTML",
+            )
+            return
+
+        expires_at = create_promocode_db(code, ptype, pval, max_uses=max_uses, duration_sec=duration_sec)
+        uname = get_bot_username()
+        link_line = (
+            f"\nСсылка автоактивации:\n<code>https://t.me/{uname}?start=promo_{code}</code>"
+            if uname
+            else ""
+        )
+        lim_txt = f"{max_uses} активаций" if max_uses > 0 else "безлимит"
+        exp_txt = f"до {format_datetime_from_ts(expires_at)} ({format_time_left(expires_at)})" if expires_at > 0 else "бессрочно"
+        bot.reply_to(
+            message,
+            f"✅ <b>Промокод создан!</b>\n\n"
+            f"<blockquote>Код: <code>{html.escape(code)}</code>\n"
+            f"Награда: <b>{format_promo_reward(ptype, pval)}</b>\n"
+            f"Лимит: <b>{lim_txt}</b>\n"
+            f"Срок: <b>{exp_txt}</b></blockquote>"
+            f"{link_line}",
+            parse_mode="HTML",
+        )
+        return
+
+    m_model = re.match(r"^(?:модель|модели|model|models)(?:\s+(.+))?$", body, flags=re.IGNORECASE)
+    if m_model:
+        clear_pending_modes(user_id)
+        arg = (m_model.group(1) or "").strip()
+        if not arg:
+            text, markup = build_model_manager_view()
+            bot.reply_to(message, text, parse_mode="HTML", reply_markup=markup)
+            return
+        if arg.lower() in ("сброс", "reset", "default"):
+            saved = set_active_models(DEFAULT_MODELS)
+            bot.reply_to(
+                message,
+                f"✅ Модель сброшена на стандартную: <code>{html.escape(', '.join(saved))}</code>",
+                parse_mode="HTML",
+            )
+            return
+        parsed = parse_models_input(arg)
+        if not parsed:
+            bot.reply_to(
+                message,
+                "⚠️ Некорректное название модели. Пример: <code>. модель gemini-3.5-flash-lite</code>",
+                parse_mode="HTML",
+            )
+            return
+        saved = set_active_models(parsed)
+        bot.reply_to(
+            message,
+            f"✅ Активная модель обновлена и сохранена:\n<code>{html.escape(', '.join(saved))}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    if low == "рассылка":
+        clear_pending_modes(user_id)
+        with _broadcast_lock:
+            _broadcast_state[user_id] = {"step": "await_content"}
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="bc_cancel"))
+        bot.reply_to(
+            message,
+            "📢 <b>Режим рассылки</b>\n\n"
+            "Отправь следующим сообщением <b>текст</b> или <b>фото с подписью</b>. "
+            "Я покажу предпросмотр с кнопкой подтверждения перед отправкой.",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return
+
+    m_grant = re.match(r"^выдать\s+премиум\s+(\S+)(?:\s+(\S+))?$", body, flags=re.IGNORECASE)
+    if m_grant:
+        target_id = resolve_target_user(m_grant.group(1))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе. Укажи ID или дождись, пока он напишет боту.")
+            return
+        dur_raw = (m_grant.group(2) or "навсегда").lower()
+        ensure_user(target_id)
+
+        if dur_raw in ("навсегда", "0", "life", "forever"):
+            with db_conn() as conn:
+                conn.cursor().execute(
+                    "UPDATE users SET is_premium = 1, pro_tier = 2, pro_until = 0 WHERE user_id = ?",
+                    (target_id,),
+                )
+            bot.reply_to(message, f"✅ Выдан <b>PRO Навсегда</b> для <code>{target_id}</code>.", parse_mode="HTML")
+            try:
+                bot.send_message(target_id, "💎 Тебе активирован <b>PRO Навсегда</b>!", parse_mode="HTML")
+            except Exception:
+                pass
+            return
+
+        if not dur_raw.isdigit() or int(dur_raw) <= 0:
+            bot.reply_to(message, "⚠️ Укажи число дней (> 0) или слово <code>навсегда</code>.", parse_mode="HTML")
+            return
+
+        days = int(dur_raw)
+        now = int(time.time())
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                "SELECT COALESCE(pro_tier, 0), COALESCE(pro_until, 0) FROM users WHERE user_id = ?",
+                (target_id,),
+            )
+            row = c.fetchone()
+            cur_tier = row[0] if row else 0
+            cur_until = row[1] if row else 0
+            if cur_tier >= 2:
+                bot.reply_to(
+                    message,
+                    f"ℹ️ У <code>{target_id}</code> уже активен <b>PRO Навсегда</b>. "
+                    "Чтобы снять его, используй <code>. забрать премиум</code>.",
+                    parse_mode="HTML",
+                )
+                return
+            base = max(now, cur_until) if cur_tier == 1 else now
+            until_ts = base + days * 86400
+            c.execute(
+                "UPDATE users SET is_premium = 1, pro_tier = 1, pro_until = ? WHERE user_id = ?",
+                (until_ts, target_id),
+            )
+        bot.reply_to(
+            message,
+            f"✅ Выдан <b>PRO на {days} дн.</b> (до {format_date_from_ts(until_ts)}) для <code>{target_id}</code>.",
+            parse_mode="HTML",
+        )
+        try:
+            bot.send_message(
+                target_id,
+                f"👑 Тебе активирован <b>PRO на {days} дн.</b> (до {format_date_from_ts(until_ts)})!",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return
+
+    m_rev = re.match(r"^забрать\s+премиум\s+(\S+)$", body, flags=re.IGNORECASE)
+    if m_rev:
+        target_id = resolve_target_user(m_rev.group(1))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        ensure_user(target_id)
+        with db_conn() as conn:
+            conn.cursor().execute(
+                "UPDATE users SET is_premium = 0, pro_tier = 0, pro_until = 0 WHERE user_id = ?",
+                (target_id,),
+            )
+        bot.reply_to(message, f"❌ PRO снят у <code>{target_id}</code>.", parse_mode="HTML")
+        return
+
+    m_scans = re.match(r"^выдать\s+сканы\s+(\S+)\s+(\d+)$", body, flags=re.IGNORECASE)
+    if m_scans:
+        target_id = resolve_target_user(m_scans.group(1))
+        amount = int(m_scans.group(2))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        if amount <= 0:
+            bot.reply_to(message, "⚠️ Количество сканов должно быть больше 0.")
+            return
+        ensure_user(target_id)
+        with db_conn() as conn:
+            conn.cursor().execute(
+                "UPDATE users SET free_limit = free_limit + ? WHERE user_id = ?",
+                (amount, target_id),
+            )
+        bot.reply_to(message, f"✅ Начислено <b>+{amount} сканов</b> юзеру <code>{target_id}</code>.", parse_mode="HTML")
+        try:
+            bot.send_message(target_id, f"⚡ Тебе начислено <b>+{amount} сканов</b> на баланс!", parse_mode="HTML")
+        except Exception:
+            pass
+        return
+
+    m_take_user = re.match(
+        r"^забрать\s+(?:сканы|рейты)\s+(\S+)\s+(\S+)$",
+        body,
+        flags=re.IGNORECASE,
+    )
+    if m_take_user:
+        target_id = resolve_target_user(m_take_user.group(1))
+        arg = m_take_user.group(2).lower()
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        ensure_user(target_id)
+        if arg in ("все", "всё", "all", "0"):
+            with db_conn() as conn:
+                conn.cursor().execute("UPDATE users SET free_limit = 0 WHERE user_id = ?", (target_id,))
+            bot.reply_to(message, f"🗑 Все сканы обнулены у <code>{target_id}</code>.", parse_mode="HTML")
+            return
+        if not arg.isdigit() or int(arg) <= 0:
+            bot.reply_to(message, "⚠️ Укажи число (> 0) или <code>все</code>.", parse_mode="HTML")
+            return
+        amount = int(arg)
+        with db_conn() as conn:
+            conn.cursor().execute(
+                "UPDATE users SET free_limit = MAX(0, free_limit - ?) WHERE user_id = ?",
+                (amount, target_id),
+            )
+        bot.reply_to(message, f"✅ Списано до <b>-{amount} сканов</b> у <code>{target_id}</code>.", parse_mode="HTML")
+        return
+
+    m_info = re.match(r"^инфо\s+(\S+)$", body, flags=re.IGNORECASE)
+    if m_info:
+        target_id = resolve_target_user(m_info.group(1))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        bot.reply_to(message, build_user_dossier_text(target_id), parse_mode="HTML")
+        return
+
+    m_ban = re.match(r"^(бан|разбан)\s+(\S+)$", body, flags=re.IGNORECASE)
+    if m_ban:
+        action = m_ban.group(1).lower()
+        target_id = resolve_target_user(m_ban.group(2))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        if is_admin(target_id):
+            bot.reply_to(message, "⚠️ Нельзя забанить администратора.")
+            return
+        ensure_user(target_id)
+        ban_val = 1 if action == "бан" else 0
+        with db_conn() as conn:
+            conn.cursor().execute("UPDATE users SET is_banned = ? WHERE user_id = ?", (ban_val, target_id))
+        msg = f"⛔ Пользователь <code>{target_id}</code> забанен." if ban_val else f"✅ Пользователь <code>{target_id}</code> разбанен."
+        bot.reply_to(message, msg, parse_mode="HTML")
+        return
+
+    bot.reply_to(message, "⚠️ Неизвестная команда. Напиши <code>. админ</code> для списка.", parse_mode="HTML")
+
+
+def _prepare_broadcast_preview(message):
+    user_id = message.from_user.id
+    with _broadcast_lock:
+        state = _broadcast_state.get(user_id)
+    if not state or state.get("step") != "await_content":
+        return False
+
+    if message.content_type == "photo":
+        payload = {
+            "step": "ready",
+            "type": "photo",
+            "file_id": message.photo[-1].file_id,
+            "caption": message.caption or "",
+        }
+    elif message.content_type == "text":
+        payload = {
+            "step": "ready",
+            "type": "text",
+            "text": message.text,
+        }
+    else:
+        bot.reply_to(message, "⚠️ Для рассылки отправь текст или фото с подписью.")
+        return True
+
+    with _broadcast_lock:
+        _broadcast_state[user_id] = payload
+
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(is_banned, 0) = 0")
+        total_targets = c.fetchone()[0]
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton(f"✅ Отправить ({total_targets})", callback_data="bc_send"),
+        InlineKeyboardButton("❌ Отмена", callback_data="bc_cancel"),
+    )
+
+    bot.send_message(message.chat.id, "👁 <b>Предпросмотр рассылки:</b>", parse_mode="HTML")
+    if payload["type"] == "photo":
+        bot.send_photo(message.chat.id, payload["file_id"], caption=payload["caption"], reply_markup=markup)
+    else:
+        bot.send_message(message.chat.id, payload["text"], reply_markup=markup)
+    return True
+
+
+def _send_broadcast_item(uid, payload):
+    if payload["type"] == "photo":
+        bot.send_photo(uid, payload["file_id"], caption=payload["caption"])
+    else:
+        bot.send_message(uid, payload["text"])
+
+
+def _run_broadcast_worker(admin_chat_id, payload):
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM users WHERE COALESCE(is_banned, 0) = 0")
+        user_ids = [row[0] for row in c.fetchall()]
+
+    ok_cnt, fail_cnt = 0, 0
+    for uid in user_ids:
+        sent = False
+        for attempt in range(2):
+            try:
+                _send_broadcast_item(uid, payload)
+                sent = True
+                break
+            except telebot.apihelper.ApiTelegramException as api_err:
+                if getattr(api_err, "error_code", None) == 429 and attempt == 0:
+                    retry_after = 3
+                    try:
+                        retry_after = int((api_err.result_json or {}).get("parameters", {}).get("retry_after", 3))
+                    except Exception:
+                        retry_after = 3
+                    time.sleep(min(max(1, retry_after), 60) + 0.5)
+                    continue
+                break
+            except Exception:
+                break
+        if sent:
+            ok_cnt += 1
+        else:
+            fail_cnt += 1
+        time.sleep(0.05)
+
+    try:
+        bot.send_message(
+            admin_chat_id,
+            f"📢 <b>Рассылка завершена!</b>\n"
+            f"Доставлено: <b>{ok_cnt}</b> | Ошибок/блок: <b>{fail_cnt}</b>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
+@bot.message_handler(
+    func=lambda m: is_admin(m.from_user.id) and is_awaiting_broadcast(m.from_user.id),
+    content_types=["text", "photo"],
+)
+def handle_admin_broadcast_input(message):
+    _prepare_broadcast_preview(message)
+
+
+@bot.message_handler(
+    func=lambda m: is_admin(m.from_user.id) and is_awaiting_model(m.from_user.id),
+    content_types=["text"],
+)
+def handle_admin_model_input(message):
+    user_id = message.from_user.id
+    parsed = parse_models_input(message.text)
+    if not parsed:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="model_cancel"))
+        bot.reply_to(
+            message,
+            "⚠️ Некорректное имя модели. Введи название латиницей, например:\n"
+            "<code>gemini-3.5-flash-lite</code>\n"
+            "<i>Или несколько моделей через запятую.</i>",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return
+
+    clear_awaiting_model(user_id)
+    saved = set_active_models(parsed)
+    text, markup = build_model_manager_view()
+    bot.reply_to(
+        message,
+        f"✅ Модель обновлена и сохранена: <code>{html.escape(', '.join(saved))}</code>\n\n{text}",
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
+
+
+def build_report_markup(photo_hash, include_profile_btn=True, is_profile=False):
+    markup = InlineKeyboardMarkup(row_width=2)
+    if photo_hash:
+        btn_label = "📊 Подробный разбор профиля" if is_profile else "📊 Подробный разбор"
+        markup.add(InlineKeyboardButton(btn_label, callback_data=f"full_{photo_hash}"))
+        if not is_profile:
+            markup.add(InlineKeyboardButton("📈 План роста (PRO)", callback_data=f"growth_{photo_hash}"))
+    row2 = []
+    if include_profile_btn and not is_profile:
+        row2.append(InlineKeyboardButton("📐 Профиль (PRO)", callback_data="profile_scan"))
+    row2.append(InlineKeyboardButton("📖 Шкала", callback_data="psl_scale_new"))
+    row2.append(InlineKeyboardButton("🏠 Меню", callback_data="main_menu_new"))
+    markup.add(*row2)
+    return markup
+
+
+def _run_growth_plan_worker(chat_id, user_id, photo_hash, scores_text, full_text, status_msg):
+    try:
+        report_context = f"{scores_text}\n\n{full_text}".strip()[:4500]
+        prompt = GROWTH_PLAN_PROMPT.format(report_context=report_context)
+        plan_text, _ = run_gemini_text_pipeline(prompt)
+        delete_status_safe(chat_id, status_msg)
+
+        if not plan_text:
+            bot.send_message(
+                chat_id,
+                "⏳ Не удалось сгенерировать план роста прямо сейчас — попробуй нажать кнопку через минуту.",
+            )
+            return
+
+        cache_set_growth_plan(photo_hash, plan_text)
+        send_long_html(chat_id, "📈 Персональный план роста (PRO)", plan_text)
+    except Exception as e:
+        log_error(f"Ошибка в _run_growth_plan_worker: {e}")
+        delete_status_safe(chat_id, status_msg)
+        bot.send_message(chat_id, "⏳ Технический сбой при генерации плана роста. Попробуй ещё раз.")
+    finally:
+        with _growth_busy_lock:
+            _growth_busy.discard((user_id, photo_hash))
+
+
+def _build_front_caption(scores_text, verdict="", limit_info="", delta_line=""):
+    score = extract_final_score(scores_text)
+    m_cat = re.search(r"(?im)^Категория[:\s]+(.+)$", scores_text)
+    cat = m_cat.group(1).strip() if m_cat else (category_by_score(score) if score else "")
+    head = (
+        f"<b>Результат: {score:.1f}/8 • {html.escape(cat)}</b>"
+        if score is not None
+        else "<b>Карточка анализа лица готова</b>"
+    )
+    delta_block = f"\n{html.escape(delta_line)}" if delta_line else ""
+    quote_block = f"\n<blockquote>{html.escape(verdict)}</blockquote>" if verdict else ""
+    return f"{head}{delta_block}{quote_block}{limit_info}"
+
+
+def _build_profile_caption(scores_text, verdict="", limit_info=""):
+    score = extract_final_score(scores_text)
+    m_cat = re.search(r"(?im)^Категория[:\s]+(.+)$", scores_text)
+    cat = m_cat.group(1).strip() if m_cat else (category_by_score(score) if score else "")
+    head = (
+        f"<b>📐 Профиль: {score:.1f}/8 • {html.escape(cat)}</b>"
+        if score is not None
+        else "<b>📐 Анализ бокового профиля готов</b>"
+    )
+    quote_block = f"\n<blockquote>{html.escape(verdict)}</blockquote>" if verdict else ""
+    return f"{head}{quote_block}{limit_info}"
+
+
+def _send_report_card_or_text(
+    chat_id,
+    card_bytes,
+    scores_text,
+    full_text,
+    photo_hash,
+    verdict="",
+    limit_info="",
+    delta_line="",
+    is_profile=False,
+    card_file_id="",
+):
+    markup = build_report_markup(
+        photo_hash if full_text else None,
+        include_profile_btn=not is_profile,
+        is_profile=is_profile,
+    )
+    if not verdict:
+        verdict = extract_verdict(scores_text)
+
+    caption = (
+        _build_profile_caption(scores_text, verdict=verdict, limit_info=limit_info)
+        if is_profile
+        else _build_front_caption(scores_text, verdict=verdict, limit_info=limit_info, delta_line=delta_line)
+    )
+
+    if card_file_id:
+        try:
+            bot.send_photo(chat_id, card_file_id, caption=caption, parse_mode="HTML", reply_markup=markup)
+            return card_file_id
+        except Exception as e:
+            log_error(f"Не удалось отправить карточку по file_id, пробую резерв: {e}")
+
+    if card_bytes:
+        try:
+            with io.BytesIO(card_bytes) as bio:
+                bio.name = "adonis_psl_card.jpg"
+                sent = bot.send_photo(chat_id, bio, caption=caption, parse_mode="HTML", reply_markup=markup)
+            if sent and getattr(sent, "photo", None):
+                return sent.photo[-1].file_id
+            return ""
+        except Exception as e:
+            log_error(f"Не удалось отправить карточку, шлю текстом: {e}")
+
+    title = "Анализ бокового профиля:" if is_profile else "Экспресс-оценка лица:"
+    delta_block = f"\n{html.escape(delta_line)}" if delta_line else ""
+    bot.send_message(
+        chat_id,
+        f"<b>{title}</b>{delta_block}\n\n<blockquote>{html.escape(scores_text)}</blockquote>{limit_info}",
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
+    return ""
+
+
+def _format_full_breakdown(full_text, geom=None):
+    parts = []
+    if geom and geom.get("metrics"):
+        title = "📐 Пропорции (468 точек лица):" if geom.get("source") == "mediapipe" else "📐 Пропорции лица:"
+        lines = [title]
+        for m in geom["metrics"]:
+            if m.get("display"):
+                lines.append(f"• {m['name']}: {m['display']} — {m['status']} ({m['norm']})")
+            else:
+                lines.append(f"• {m['name']}: {m['status']} ({m['norm']})")
+        lines.append(f"• Симметрия: {geom['symmetry_pct']:.1f}% — {geom['symmetry_status']}")
+        if geom.get("face_shape"):
+            lines.append(f"• Форма лица: {geom['face_shape']}")
+        parts.append("\n".join(lines))
+    if full_text:
+        parts.append(full_text.strip())
+    return "\n\n".join(parts)
+
+
+def _send_no_scans_prompt(chat_id, user_id=None):
+    has_sub_bonus = (
+        user_id is not None
+        and is_channel_bonus_enabled()
+        and not is_channel_bonus_claimed(user_id)
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    if has_sub_bonus:
+        markup.add(
+            InlineKeyboardButton(
+                f"📢 +{CHANNEL_SUB_BONUS} скан за подписку на канал",
+                callback_data="channel_bonus",
+            )
+        )
+    markup.add(InlineKeyboardButton(f"🤝 Пригласить друга (+{REFERRAL_BONUS} скан)", callback_data="get_ref"))
+    markup.add(InlineKeyboardButton("💎 Купить сканы / PRO", callback_data="buy_menu"))
+    markup.add(InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
+
+    if has_sub_bonus:
+        msg = (
+            "❌ <b>На балансе нет доступных сканов.</b>\n\n"
+            f"Подпишись на наш канал (+{CHANNEL_SUB_BONUS} бесплатный скан), "
+            f"пригласи друга (+{REFERRAL_BONUS} скан) или выбери тариф:"
+        )
+    else:
+        msg = (
+            "❌ <b>Бесплатные сканы исчерпаны.</b>\n\n"
+            f"Пригласи друга по ссылке (+{REFERRAL_BONUS} скан) или выбери тариф:"
+        )
+    bot.send_message(chat_id, msg, parse_mode="HTML", reply_markup=markup)
+
+
+def _send_pro_daily_limit_prompt(chat_id, daily_limit):
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("⚡ Докупить пакет сканов", callback_data="buy_menu"))
+    markup.add(InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
+    bot.send_message(
+        chat_id,
+        f"⏳ <b>Дневной лимит PRO исчерпан ({daily_limit}/{daily_limit}).</b>\n"
+        "Лимит обновится завтра в 00:00, либо можно докупить пакет дополнительных сканов:",
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
+
+
+def process_adult_photo(message, status_msg=None):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    free_limit, pro_tier, _, _ = get_user_access(user_id)
+    admin_user = is_admin(user_id)
+    daily_limit = get_pro_daily_limit_for_tier(pro_tier)
+
+    if not admin_user:
+        if pro_tier > 0:
+            if get_pro_remaining_today(user_id, pro_tier) <= 0 and free_limit <= 0:
+                delete_status_safe(chat_id, status_msg)
+                _send_pro_daily_limit_prompt(chat_id, daily_limit)
+                return
+        elif free_limit <= 0:
+            delete_status_safe(chat_id, status_msg)
+            _send_no_scans_prompt(chat_id, user_id=user_id)
+            return
+
+    try:
+        if not status_msg:
+            status_msg = send_status_safe(message, "⚡ Сканю пропорции лица...")
+        processed_bytes = download_and_process_photo(message)
+    except ValueError as val_err:
+        delete_status_safe(chat_id, status_msg)
+        bot.send_message(chat_id, f"⚠️ {val_err}")
+        return
+    except Exception as e:
+        delete_status_safe(chat_id, status_msg)
+        log_error(f"Ошибка скачивания фото: {e}")
+        bot.send_message(chat_id, "⏳ Не удалось скачать фото. Попробуй ещё раз.")
+        return
+
+    photo_hash = hashlib.sha256(CACHE_VERSION.encode("utf-8") + processed_bytes).hexdigest()[:32]
+    cached = cache_get(photo_hash)
+    if cached:
+        scores_text, full_text, card_bytes, card_file_id, _ = cached
+        delete_status_safe(chat_id, status_msg)
+        _send_report_card_or_text(
+            chat_id, card_bytes, scores_text, full_text, photo_hash,
+            is_profile=False, card_file_id=card_file_id,
+        )
+        return
+
+    consumed_mode = None
+    if not admin_user:
+        if pro_tier > 0:
+            if try_consume_pro_scan(user_id, daily_limit):
+                consumed_mode = "pro"
+            elif try_consume_extra_scan(user_id):
+                consumed_mode = "extra"
+            else:
+                delete_status_safe(chat_id, status_msg)
+                _send_pro_daily_limit_prompt(chat_id, daily_limit)
+                return
+        else:
+            if not try_consume_scan(user_id):
+                delete_status_safe(chat_id, status_msg)
+                _send_no_scans_prompt(chat_id, user_id=user_id)
+                return
+            consumed_mode = "free"
+
+    def refund_if_needed():
+        if consumed_mode in ("free", "extra"):
+            refund_scan(user_id)
+        elif consumed_mode == "pro":
+            refund_pro_scan(user_id)
+
+    scan_completed = False
+    try:
+        geom = analyze_face_geometry(processed_bytes)
+        prompt = build_adult_prompt(geom)
+        raw_response, api_errors = run_gemini_pipeline(processed_bytes, prompt)
+
+        if not raw_response:
+            refund_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, format_api_failure(api_errors), parse_mode="HTML")
+            return
+
+        scores_part, full_text = split_model_response(raw_response)
+        verdict = extract_verdict(scores_part)
+        if geom is None:
+            geom = extract_visual_geometry(scores_part)
+        scores_text, params_dict, final_score, category = normalize_adult_scores(scores_part)
+
+        if not scores_text:
+            refund_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, "🤔 Не удалось распознать лицо. Пришли чёткое фото анфас при хорошем свете.")
+            return
+
+        full_combined = _format_full_breakdown(full_text, geom=geom)
+        card_bytes = None
+        try:
+            card_bytes = render_front_report_card(
+                processed_bytes, params_dict or {}, final_score, category, verdict, geom,
+                bot_username=get_bot_username(),
+            )
+        except Exception as card_err:
+            log_error(f"Ошибка рендера карточки: {card_err}")
+
+        if consumed_mode == "free":
+            rem_limit, _, _, _ = get_user_access(user_id)
+            limit_info = (
+                "\n<i>Сканы закончились — пригласи друга (/ref) или пополни баланс (/buy).</i>"
+                if rem_limit == 0
+                else f"\n<i>Осталось сканов: {rem_limit}</i>"
+            )
+        elif consumed_mode == "extra":
+            rem_limit, _, _, _ = get_user_access(user_id)
+            limit_info = f"\n<i>Списан доп. скан из пакета (осталось доп.: {rem_limit})</i>"
+        elif consumed_mode == "pro":
+            pro_left = get_pro_remaining_today(user_id, pro_tier)
+            limit_info = f"\n<i>PRO-сканов на сегодня: {pro_left}/{daily_limit}</i>"
+        else:
+            limit_info = ""
+
+        delta_val = preview_score_delta(user_id, final_score)
+        delta_line = format_score_delta(delta_val)
+
+        delete_status_safe(chat_id, status_msg)
+        sent_file_id = _send_report_card_or_text(
+            chat_id, card_bytes, scores_text, full_combined, photo_hash,
+            verdict=verdict, limit_info=limit_info, delta_line=delta_line, is_profile=False,
+        )
+        scan_completed = True
+        cache_put(photo_hash, scores_text, full_combined, card_image=card_bytes, card_file_id=sent_file_id)
+        record_user_scan_stats(user_id, score=final_score)
+
+    except Exception as e:
+        log_error(f"Ошибка в process_adult_photo: {e}")
+        if not scan_completed:
+            refund_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, "⏳ Произошёл технический сбой. Попробуй ещё раз.")
+    finally:
+        gc.collect()
+
+
+def process_profile_photo(message, status_msg=None):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    def _keep_profile_markup():
+        set_awaiting_profile(user_id)
+        m = InlineKeyboardMarkup()
+        m.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_profile"))
+        return m
+
+    free_limit, pro_tier, _, _ = get_user_access(user_id)
+    admin_user = is_admin(user_id)
+    daily_limit = get_pro_daily_limit_for_tier(pro_tier)
+
+    if not admin_user:
+        if pro_tier <= 0:
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, "👑 Анализ бокового профиля доступен только с активным PRO (/buy).")
+            return
+        if get_pro_remaining_today(user_id, pro_tier) <= 0 and free_limit <= 0:
+            delete_status_safe(chat_id, status_msg)
+            _send_pro_daily_limit_prompt(chat_id, daily_limit)
+            return
+
+    try:
+        if not status_msg:
+            status_msg = send_status_safe(message, "📐 Анализирую структуру бокового профиля...")
+        processed_bytes = download_and_process_photo(message)
+    except ValueError as val_err:
+        delete_status_safe(chat_id, status_msg)
+        bot.send_message(
+            chat_id,
+            f"⚠️ {val_err}\nРежим профиля активен — отправь другое фото сбоку или нажми «Отмена».",
+            reply_markup=_keep_profile_markup(),
+        )
+        return
+    except Exception as e:
+        delete_status_safe(chat_id, status_msg)
+        log_error(f"Ошибка скачивания фото профиля: {e}")
+        bot.send_message(chat_id, "⏳ Не удалось скачать фото. Попробуй ещё раз.", reply_markup=_keep_profile_markup())
+        return
+
+    photo_hash = "p" + hashlib.sha256(PROFILE_CACHE_VERSION.encode("utf-8") + processed_bytes).hexdigest()[:31]
+    cached = cache_get(photo_hash)
+    if cached:
+        scores_text, full_text, card_bytes, card_file_id, _ = cached
+        delete_status_safe(chat_id, status_msg)
+        _send_report_card_or_text(
+            chat_id, card_bytes, scores_text, full_text, photo_hash,
+            is_profile=True, card_file_id=card_file_id,
+        )
+        return
+
+    consumed_mode = None
+    if not admin_user:
+        if try_consume_pro_scan(user_id, daily_limit):
+            consumed_mode = "pro"
+        elif try_consume_extra_scan(user_id):
+            consumed_mode = "extra"
+        else:
+            delete_status_safe(chat_id, status_msg)
+            _send_pro_daily_limit_prompt(chat_id, daily_limit)
+            return
+
+    def refund_profile_if_needed():
+        if consumed_mode == "pro":
+            refund_pro_scan(user_id)
+        elif consumed_mode == "extra":
+            refund_scan(user_id)
+
+    scan_completed = False
+    try:
+        raw_response, api_errors = run_gemini_pipeline(processed_bytes, PROFILE_RATING_PROMPT)
+        if not raw_response:
+            refund_profile_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, format_api_failure(api_errors), parse_mode="HTML", reply_markup=_keep_profile_markup())
+            return
+
+        profile_data, full_text = parse_profile_response(raw_response)
+        if not profile_data:
+            refund_profile_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(
+                chat_id,
+                "🤔 Не удалось распознать боковой профиль. Пришли чёткое фото строго сбоку (90°), чтобы была видна линия челюсти.\n\n"
+                "<i>Режим профиля остаётся активным — отправь следующее фото или нажми «Отмена».</i>",
+                parse_mode="HTML",
+                reply_markup=_keep_profile_markup(),
+            )
+            return
+
+        card_bytes = None
+        try:
+            card_bytes = render_profile_report_card(processed_bytes, profile_data, bot_username=get_bot_username())
+        except Exception as card_err:
+            log_error(f"Ошибка рендера карточки профиля: {card_err}")
+
+        if consumed_mode == "pro":
+            limit_info = f"\n<i>PRO-сканов на сегодня: {get_pro_remaining_today(user_id, pro_tier)}/{daily_limit}</i>"
+        elif consumed_mode == "extra":
+            rem_limit, _, _, _ = get_user_access(user_id)
+            limit_info = f"\n<i>Списан доп. скан из пакета (осталось доп.: {rem_limit})</i>"
+        else:
+            limit_info = ""
+
+        delete_status_safe(chat_id, status_msg)
+        sent_file_id = _send_report_card_or_text(
+            chat_id, card_bytes, profile_data["summary_text"], full_text, photo_hash,
+            verdict=profile_data.get("verdict", ""), limit_info=limit_info, is_profile=True,
+        )
+        scan_completed = True
+        cache_put(photo_hash, profile_data["summary_text"], full_text, card_image=card_bytes, card_file_id=sent_file_id)
+        record_user_scan_stats(user_id, score=None)
+
+    except Exception as e:
+        log_error(f"Ошибка в process_profile_photo: {e}")
+        if not scan_completed:
+            refund_profile_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, "⏳ Произошёл технический сбой. Попробуй ещё раз.")
+    finally:
+        gc.collect()
+
+
+def scan_worker_loop():
+    while True:
+        _, _, scan_type, message, status_msg = _scan_queue.get()
+        user_id = message.from_user.id
+        try:
+            if scan_type == "profile":
+                process_profile_photo(message, status_msg=status_msg)
+            else:
+                process_adult_photo(message, status_msg=status_msg)
+        except Exception as e:
+            log_error(f"Ошибка в scan_worker_loop: {e}")
+        finally:
+            release_user(user_id)
+            _scan_queue.task_done()
+
+
+def start_scan_workers():
+    for i in range(SCAN_WORKERS):
+        threading.Thread(target=scan_worker_loop, name=f"scan-worker-{i + 1}", daemon=True).start()
+
+
+def handle_receipt_submission(message, plan_id):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    plan = PLANS.get(plan_id)
+    if not plan:
+        bot.send_message(chat_id, "⚠️ Тариф не найден. Открой /buy заново.")
+        return
+
+    ok, err_msg = check_plan_allowed(user_id, plan)
+    if not ok:
+        bot.send_message(chat_id, f"⚠️ {err_msg}")
+        return
+
+    existing_req = get_pending_payment_request_id(user_id)
+    if existing_req:
+        bot.reply_to(
+            message,
+            f"⏳ У тебя уже есть нерассмотренная заявка <b>#{existing_req}</b>.\n"
+            "Дождись проверки администратором или напиши в /paysupport.",
+            parse_mode="HTML",
+        )
+        return
+
+    pricing = get_plan_pricing(plan_id, user_id=user_id)
+    req_id = create_payment_request(
+        user_id,
+        plan_id,
+        promo_code=pricing["promo_code"],
+        rub_amount=pricing["rub"],
+    )
+    username = f"@{message.from_user.username}" if message.from_user.username else "без юзернейма"
+    full_name = html.escape(message.from_user.first_name or "Пользователь")
+    promo_note = (
+        f"\nПромокод: <code>{html.escape(pricing['promo_code'])}</code> (-{pricing['discount_pct']}%)"
+        if pricing["promo_code"]
+        else ""
+    )
+
+    caption = (
+        f"💳 <b>Чек по заявке #{req_id}</b>\n\n"
+        f"Юзер: {full_name} ({html.escape(username)})\n"
+        f"ID: <code>{user_id}</code>\n"
+        f"Тариф: <b>{html.escape(plan['title'])}</b> ({pricing['rub']} ₽){promo_note}"
+    )
+
+    admin_markup = InlineKeyboardMarkup()
+    admin_markup.add(
+        InlineKeyboardButton("✅ Выдать доступ", callback_data=f"payok_{req_id}"),
+        InlineKeyboardButton("❌ Отклонить", callback_data=f"payno_{req_id}"),
+    )
+
+    sent_any = False
+    for admin_id in ADMIN_IDS:
+        try:
+            if message.photo:
+                bot.send_photo(admin_id, message.photo[-1].file_id, caption=caption, parse_mode="HTML", reply_markup=admin_markup)
+            elif message.document:
+                bot.send_document(admin_id, message.document.file_id, caption=caption, parse_mode="HTML", reply_markup=admin_markup)
+            sent_any = True
+        except Exception as e:
+            log_error(f"Не удалось отправить чек админу {admin_id}: {e}")
+
+    if sent_any:
+        bot.reply_to(
+            message,
+            f"✅ <b>Чек по заявке #{req_id} отправлен на проверку!</b>\n"
+            f"Тариф: <b>{html.escape(plan['title'])}</b>\n"
+            "После подтверждения доступ активируется автоматически.",
+            parse_mode="HTML",
+        )
+    else:
+        bot.reply_to(message, "⚠️ Не удалось отправить чек администратору. Нажми /paysupport.")
+
+
+@bot.message_handler(content_types=["photo", "document"])
+def handle_photo(message):
+    user_id = message.from_user.id
+    touch_user(message.from_user)
+    if is_user_banned(user_id):
+        bot.send_message(message.chat.id, "⛔ Доступ к боту ограничен.")
+        return
+
+    if is_admin(user_id) and _prepare_broadcast_preview(message):
+        return
+
+    if _is_duplicate_media_group(user_id, getattr(message, "media_group_id", None)):
+        return
+
+    if not check_rate_limit(user_id, "media", min_interval=2.5, max_per_min=10):
+        bot.reply_to(message, "⏳ Слишком частые запросы. Подожди пару секунд.")
+        return
+
+    pending_plan_id, receipt_expired = pop_awaiting_receipt(user_id)
+    if receipt_expired:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("💎 Открыть тарифы", callback_data="buy_menu"))
+        bot.send_message(
+            message.chat.id,
+            "⏳ <b>Время ожидания чека истекло (30 мин).</b>\n"
+            "Чтобы отправить чек, выбери тариф заново через меню ниже — фото не отправлено на скан.",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return
+
+    if pending_plan_id:
+        if message.content_type == "document" and not is_receipt_document(message):
+            set_awaiting_receipt(user_id, pending_plan_id)
+            bot.send_message(message.chat.id, "⚠️ Пришли скриншот чека (фото или PDF-файл).")
+            return
+        handle_receipt_submission(message, pending_plan_id)
+        return
+
+    is_profile_mode, profile_expired = pop_awaiting_profile(user_id)
+    if profile_expired:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("📐 Включить режим профиля", callback_data="profile_scan"))
+        bot.send_message(
+            message.chat.id,
+            "⏳ <b>Режим анализа бокового профиля истёк (30 мин).</b>\n"
+            "Нажми кнопку ниже и отправь фото заново, чтобы оно не пошло как скан анфас.",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return
+
+    if message.content_type == "document" and not is_image_document(message):
+        if is_profile_mode:
+            set_awaiting_profile(user_id)
+        bot.send_message(message.chat.id, "Пришли фото или изображение (JPG/PNG/WEBP).")
+        return
+
+    if not acquire_user(user_id):
+        if is_profile_mode:
+            set_awaiting_profile(user_id)
+        bot.send_message(message.chat.id, "⏳ Предыдущее фото ещё обрабатывается — подожди пару секунд.")
+        return
+
+    try:
+        _, pro_tier, _, is_adult = get_user_access(user_id)
+        if not is_adult and not is_admin(user_id):
+            release_user(user_id)
+            if is_profile_mode:
+                set_awaiting_profile(user_id)
+            send_adult_confirm(message.chat.id)
+            return
+
+        if not is_admin(user_id) and pro_tier <= 0 and _scan_queue.qsize() >= MAX_SCAN_QUEUE_SIZE:
+            release_user(user_id)
+            if is_profile_mode:
+                set_awaiting_profile(user_id)
+            bot.send_message(message.chat.id, "⏳ Очередь переполнена. Попробуй отправить фото через минуту.")
+            return
+
+        scan_type = "profile" if is_profile_mode else "front"
+        front_label = "Сканю пропорции по 468 точкам" if is_mediapipe_available() else "Сканю пропорции лица"
+
+        if is_admin(user_id) or pro_tier >= 2:
+            priority = 0
+            status_text = "📐 Анализирую боковой профиль (топ-приоритет)..." if is_profile_mode else f"⚡ {front_label} (топ-приоритет)..."
+        elif pro_tier == 1:
+            priority = 1
+            status_text = "📐 Анализирую боковой профиль (PRO-приоритет)..." if is_profile_mode else f"⚡ {front_label} (PRO-приоритет)..."
+        else:
+            priority = 2
+            status_text = "⏳ Фото добавлено в очередь..." if _scan_queue.qsize() >= SCAN_WORKERS else f"⚡ {front_label}..."
+
+        status_msg = send_status_safe(message, status_text)
+        _scan_queue.put((priority, next(_scan_seq), scan_type, message, status_msg))
+    except Exception as e:
+        release_user(user_id)
+        if is_profile_mode:
+            set_awaiting_profile(user_id)
+        log_error(f"Ошибка постановки фото в очередь: {e}")
+        bot.send_message(message.chat.id, "⏳ Произошла ошибка при обработке фото. Попробуй ещё раз.")
+
+
+def check_plan_allowed(user_id, plan):
+    if plan["type"] in ("pro30", "pro_life"):
+        _, pro_tier, _, _ = get_user_access(user_id)
+        if pro_tier >= 2:
+            return False, "У тебя уже активен PRO Навсегда!"
+    return True, None
+
+
+@bot.pre_checkout_query_handler(func=lambda query: True)
+def handle_pre_checkout(pre_checkout_query):
+    user_id = pre_checkout_query.from_user.id
+    if is_user_banned(user_id):
+        bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Доступ ограничен.")
+        return
+
+    payload = pre_checkout_query.invoice_payload or ""
+    parts = payload.split(":")
+    if len(parts) in (3, 4) and parts[0] == "plan" and parts[1] in PLANS and parts[2] == str(user_id):
+        plan_id = parts[1]
+        plan = PLANS[plan_id]
+        promo_code = parts[3].strip().upper() if len(parts) == 4 else ""
+
+        if promo_code:
+            pct = validate_discount_promo_for_user(user_id, promo_code)
+            if pct <= 0:
+                bot.answer_pre_checkout_query(
+                    pre_checkout_query.id,
+                    ok=False,
+                    error_message="Промокод истёк, исчерпан или уже привязан к заявке. Открой /buy заново.",
+                )
+                return
+            expected_stars = calc_discounted_price(plan["stars"], pct)
+        else:
+            expected_stars = plan["stars"]
+
+        if pre_checkout_query.currency != "XTR" or pre_checkout_query.total_amount != expected_stars:
+            bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Сумма платежа не совпадает.")
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message=err_msg or "Тариф недоступен.")
+            return
+        bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+    else:
+        bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Тариф не найден.")
+
+
+@bot.message_handler(content_types=["successful_payment"])
+def handle_successful_payment(message):
+    sp = message.successful_payment
+    user_id = message.from_user.id
+    parts = (sp.invoice_payload or "").split(":")
+    if len(parts) not in (3, 4) or parts[0] != "plan" or parts[1] not in PLANS or parts[2] != str(user_id):
+        log_error(f"Некорректный successful_payment payload от {user_id}: {sp.invoice_payload}")
+        return
+
+    plan_id = parts[1]
+    plan = PLANS[plan_id]
+    promo_code = parts[3].strip().upper() if len(parts) == 4 else ""
+
+    if promo_code:
+        pct = get_promo_discount_value_raw(promo_code)
+        expected_stars = calc_discounted_price(plan["stars"], pct) if pct > 0 else -1
+    else:
+        expected_stars = plan["stars"]
+
+    if sp.currency != "XTR" or sp.total_amount != expected_stars:
+        log_error(
+            f"Несовпадение суммы Stars от {user_id}: {sp.total_amount} {sp.currency} != {expected_stars} XTR"
+        )
+        return
+
+    if not record_stars_payment(sp.telegram_payment_charge_id, user_id, plan_id, sp.total_amount):
+        return
+
+    if promo_code:
+        consume_discount_promo(user_id, promo_code)
+
+    apply_plan_to_user(user_id, plan_id)
+    bot.send_message(
+        message.chat.id,
+        f"✅ <b>Оплата прошла успешно!</b>\nАктивировано: <b>{html.escape(plan['title'])}</b>.",
+        parse_mode="HTML",
+    )
+
+    username = f"@{message.from_user.username}" if message.from_user.username else "без юзернейма"
+    promo_str = f" (промокод {html.escape(promo_code)})" if promo_code else ""
+    for admin_id in ADMIN_IDS:
+        try:
+            bot.send_message(
+                admin_id,
+                f"⭐ <b>Оплата Telegram Stars</b>\n"
+                f"Юзер: <code>{user_id}</code> ({html.escape(username)})\n"
+                f"Тариф: {html.escape(plan['title'])} — <b>{sp.total_amount} ⭐</b>{promo_str}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    if not call.message:
+        safe_answer(call.id)
+        return
+
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
+    is_text_msg = call.message.content_type == "text"
+    edit_id = msg_id if is_text_msg else None
+
+    touch_user(call.from_user)
+    if is_user_banned(user_id):
+        safe_answer(call.id, "Доступ ограничен.", show_alert=True)
+        return
+
+    if not check_rate_limit(user_id, "cb", min_interval=0.4, max_per_min=35):
+        safe_answer(call.id, "Не так быстро 🙂")
+        return
+
+    data = call.data or ""
+
+    if data == "confirm_18":
+        set_user_adult(user_id)
+        safe_answer(call.id, "Возраст подтверждён")
+        try:
+            bot.edit_message_text("✅ Доступ открыт. Отправь фото лица анфас для анализа.", chat_id, msg_id)
+        except Exception:
+            bot.send_message(chat_id, "✅ Доступ открыт. Отправь фото лица анфас для анализа.")
+
+    elif data == "main_menu":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_main_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "main_menu_new":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_main_menu_view(user_id)
+        bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+
+    elif data == "psl_scale":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_psl_scale_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "psl_scale_new":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_psl_scale_view()
+        bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+
+    elif data == "scan_front_tip":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text = (
+            "<b>📸 Анализ лица анфас</b>\n\n"
+            "<blockquote>• Смотри прямо в камеру без наклона головы\n"
+            "• Ровный фронтальный свет, без жёстких теней\n"
+            "• Нейтральное выражение лица, без фильтров и очков</blockquote>\n\n"
+            "Просто отправь фото прямо сюда в чат."
+        )
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("📖 Шкала PSL", callback_data="psl_scale"))
+        markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "my_profile":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_profile_cabinet_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "buy_menu":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_buy_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "enter_promo":
+        clear_pending_modes(user_id)
+        set_awaiting_promo(user_id)
+        safe_answer(call.id, "Введи промокод")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_promo"))
+        edit_or_send(
+            chat_id,
+            "🎁 <b>Активация промокода</b>\n\n"
+            "Отправь промокод следующим сообщением в чат (например: <code>ADONIS</code>).",
+            reply_markup=markup,
+            message_id=edit_id,
+        )
+
+    elif data == "cancel_promo":
+        clear_awaiting_promo(user_id)
+        safe_answer(call.id, "Отменено")
+        text, markup = build_main_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "channel_bonus":
+        clear_pending_modes(user_id)
+        if not is_channel_bonus_enabled():
+            safe_answer(call.id, "Бонус пока недоступен.", show_alert=True)
+            return
+        if is_channel_bonus_claimed(user_id):
+            safe_answer(call.id, "Ты уже получил бонус за подписку!", show_alert=True)
+            return
+        safe_answer(call.id)
+        text, markup = build_channel_bonus_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "check_sub":
+        if not is_channel_bonus_enabled():
+            safe_answer(call.id, "Канал не настроен.", show_alert=True)
+            return
+        if is_channel_bonus_claimed(user_id):
+            safe_answer(call.id, "Бонус уже получен!", show_alert=True)
+            return
+        try:
+            member = bot.get_chat_member(get_channel_chat_id(), user_id)
+            is_sub = getattr(member, "status", "") in ("member", "administrator", "creator")
+        except Exception as e:
+            log_error(f"Ошибка проверки подписки на {CHANNEL_ID}: {e}")
+            safe_answer(call.id, "Не удалось проверить подписку. Попробуй позже.", show_alert=True)
+            return
+
+        if not is_sub:
+            safe_answer(call.id, "Подписка не найдена. Сначала подпишись на канал!", show_alert=True)
+            return
+
+        if claim_channel_bonus(user_id):
+            safe_answer(call.id, f"+{CHANNEL_SUB_BONUS} скан начислен!", show_alert=True)
+            text, markup = build_main_menu_view(user_id)
+            edit_or_send(
+                chat_id,
+                f"🎉 <b>Спасибо за подписку!</b> Начислено <b>+{CHANNEL_SUB_BONUS} бесплатный скан</b>.\n\n{text}",
+                reply_markup=markup,
+                message_id=edit_id,
+            )
+        else:
+            safe_answer(call.id, "Бонус уже был выдан ранее.", show_alert=True)
+
+    elif data == "get_ref":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_ref_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "support_menu":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_support_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "profile_scan":
+        clear_pending_modes(user_id)
+        _, pro_tier, _, _ = get_user_access(user_id)
+        if pro_tier <= 0 and not is_admin(user_id):
+            safe_answer(call.id, "Доступно в PRO")
+            markup = InlineKeyboardMarkup(row_width=1)
+            markup.add(InlineKeyboardButton("👑 Подключить PRO", callback_data="buy_menu"))
+            markup.add(InlineKeyboardButton("🤝 Получить PRO за друзей", callback_data="get_ref"))
+            markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+            text = (
+                "<b>📐 Анализ бокового профиля (PRO)</b>\n\n"
+                "<blockquote>Структурная карточка по 6 ключевым параметрам:\n"
+                "• Проекция подбородка и максиллы\n"
+                "• Чёткость угла челюсти\n"
+                "• Шейно-подбородочный угол\n"
+                "• Профиль носа и общая гармония</blockquote>\n\n"
+                "Открывается на тарифах <b>PRO 30 дней</b> и <b>PRO Навсегда</b>."
+            )
+            edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+            return
+
+        set_awaiting_profile(user_id)
+        safe_answer(call.id, "Отправь фото в профиль")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_profile"))
+        text = (
+            "<b>📐 Режим анализа бокового профиля</b>\n\n"
+            "<blockquote>Отправь чёткое фото строго <b>сбоку (90°)</b> при хорошем свете, "
+            "чтобы была видна линия челюсти, подбородок и профиль носа.</blockquote>"
+        )
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "cancel_profile":
+        clear_awaiting_profile(user_id)
+        safe_answer(call.id, "Режим профиля отменён")
+        text, markup = build_main_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "cancel_pay":
+        clear_pending_modes(user_id)
+        safe_answer(call.id, "Оплата отменена")
+        text, markup = build_main_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data.startswith("plan_"):
+        clear_pending_modes(user_id)
+        plan_id = data[5:]
+        plan = PLANS.get(plan_id)
+        if not plan:
+            safe_answer(call.id, "Тариф не найден.", show_alert=True)
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            safe_answer(call.id, err_msg, show_alert=True)
+            return
+
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        safe_answer(call.id)
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton(f"⭐ Оплатить {pr['stars']} Stars (мгновенно)", callback_data=f"stars_{plan_id}"))
+        if PAYMENT_CARD:
+            markup.add(InlineKeyboardButton(f"💳 Перевод на карту (только РФ) — {pr['rub']} ₽", callback_data=f"card_{plan_id}"))
+        markup.add(InlineKeyboardButton("⬅️ К тарифам", callback_data="buy_menu"))
+
+        promo_info = (
+            f"\n🎁 Промокод <code>{html.escape(pr['promo_code'])}</code>: скидка <b>-{pr['discount_pct']}%</b> "
+            f"(<s>{pr['orig_stars']} ⭐</s> → <b>{pr['stars']} ⭐</b> | <s>{pr['orig_rub']} ₽</s> → <b>{pr['rub']} ₽</b>)"
+            if pr["promo_code"]
+            else ""
+        )
+        text = (
+            f"<b>{html.escape(plan['title'])}</b>\n\n"
+            f"<blockquote>{html.escape(plan['desc'])}{promo_info}</blockquote>\n\n"
+            "Выбери удобный способ оплаты:"
+        )
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data.startswith("stars_"):
+        clear_pending_modes(user_id)
+        plan_id = data[6:]
+        plan = PLANS.get(plan_id)
+        if not plan:
+            safe_answer(call.id, "Тариф не найден.", show_alert=True)
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            safe_answer(call.id, err_msg, show_alert=True)
+            return
+
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        inv_payload = (
+            f"plan:{plan_id}:{user_id}:{pr['promo_code']}"
+            if pr["promo_code"]
+            else f"plan:{plan_id}:{user_id}"
+        )
+        desc = (
+            f"{plan['desc']} (промокод {pr['promo_code']} -{pr['discount_pct']}%)"
+            if pr["promo_code"]
+            else plan["desc"]
+        )
+        safe_answer(call.id, "Открываю счёт...")
+        try:
+            bot.send_invoice(
+                chat_id=chat_id,
+                title=plan["title"],
+                description=desc,
+                invoice_payload=inv_payload,
+                provider_token="",
+                currency="XTR",
+                prices=[LabeledPrice(label=plan["title"], amount=pr["stars"])],
+            )
+        except Exception as e:
+            log_error(f"Ошибка выставления счёта Stars: {e}")
+            bot.send_message(chat_id, "⚠️ Не удалось создать счёт Stars. Попробуй позже или выбери карту.")
+
+    elif data.startswith("card_"):
+        clear_pending_modes(user_id)
+        plan_id = data[5:]
+        plan = PLANS.get(plan_id)
+        if not plan or not PAYMENT_CARD:
+            safe_answer(call.id, "Оплата картой временно недоступна.", show_alert=True)
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            safe_answer(call.id, err_msg, show_alert=True)
+            return
+
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        safe_answer(call.id)
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("✅ Я оплатил — отправить чек", callback_data=f"paid_{plan_id}"))
+        markup.add(InlineKeyboardButton("⬅️ К тарифам", callback_data="buy_menu"))
+
+        sum_str = (
+            f"<s>{pr['orig_rub']} ₽</s> <b>{pr['rub']} ₽</b> (промокод {html.escape(pr['promo_code'])} -{pr['discount_pct']}%)"
+            if pr["promo_code"]
+            else f"<b>{pr['rub']} ₽</b>"
+        )
+        text = (
+            f"<b>💳 Оплата картой (только РФ): {html.escape(plan['title'])}</b>\n\n"
+            f"<blockquote>Сумма: {sum_str}\n"
+            f"Банк: <b>{html.escape(PAYMENT_BANK)}</b>\n"
+            f"Карта: <code>{html.escape(PAYMENT_CARD)}</code></blockquote>\n\n"
+            "После перевода нажми кнопку ниже и отправь чек."
+        )
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data.startswith("paid_"):
+        plan_id = data[5:]
+        plan = PLANS.get(plan_id)
+        if not plan or not PAYMENT_CARD:
+            safe_answer(call.id, "Оплата картой временно недоступна.", show_alert=True)
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            safe_answer(call.id, err_msg, show_alert=True)
+            return
+        existing_req = get_pending_payment_request_id(user_id)
+        if existing_req:
+            safe_answer(call.id, f"Заявка #{existing_req} ещё на проверке.", show_alert=True)
+            return
+
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        set_awaiting_receipt(user_id, plan_id)
+        safe_answer(call.id, "Отправь скриншот или PDF-чек")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_pay"))
+        text = (
+            f"📸 <b>Отправь скриншот или PDF-чек</b> об оплате "
+            f"<b>{html.escape(plan['title'])}</b> ({pr['rub']} ₽) прямо сюда в чат."
+        )
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data.startswith("payok_") or data.startswith("payno_"):
+        if not is_admin(user_id):
+            safe_answer(call.id, "Нет прав.", show_alert=True)
+            return
+        is_approve = data.startswith("payok_")
+        try:
+            req_id = int(data.split("_", 1)[1])
+        except ValueError:
+            safe_answer(call.id, "Некорректная заявка.", show_alert=True)
+            return
+
+        resolved = resolve_payment_request(req_id, "approved" if is_approve else "rejected")
+        if not resolved:
+            safe_answer(call.id, "Заявка уже обработана.", show_alert=True)
+            return
+
+        target_id, plan_id, req_promo, _ = resolved
+        plan = PLANS.get(plan_id)
+
+        if is_approve and plan:
+            if req_promo:
+                consume_discount_promo(target_id, req_promo)
+            apply_plan_to_user(target_id, plan_id)
+            safe_answer(call.id, "Доступ выдан!")
+            status_suffix = "\n\n✅ <b>Доступ выдан</b>"
+            try:
+                bot.send_message(
+                    target_id,
+                    f"✅ <b>Оплата подтверждена!</b>\nАктивировано: <b>{html.escape(plan['title'])}</b>.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        else:
+            safe_answer(call.id, "Заявка отклонена.")
+            status_suffix = "\n\n❌ <b>Отклонено</b>"
+            try:
+                bot.send_message(target_id, f"❌ Заявка на оплату #{req_id} отклонена администратором.")
+            except Exception:
+                pass
+
+        try:
+            if call.message.content_type in ("photo", "document"):
+                base_cap = call.message.html_caption or html.escape(call.message.caption or "")
+                bot.edit_message_caption(base_cap + status_suffix, chat_id, msg_id, parse_mode="HTML", reply_markup=None)
+            else:
+                base_txt = call.message.html_text or html.escape(call.message.text or "")
+                bot.edit_message_text(base_txt + status_suffix, chat_id, msg_id, parse_mode="HTML", reply_markup=None)
+        except Exception:
+            try:
+                bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
+            except Exception:
+                pass
+
+    elif data.startswith("setmodel_"):
+        if not is_admin(user_id):
+            safe_answer(call.id, "Нет прав.", show_alert=True)
+            return
+        clear_awaiting_model(user_id)
+        chosen = data[9:].strip()
+        parsed = parse_models_input(chosen)
+        if not parsed:
+            safe_answer(call.id, "Некорректная модель.", show_alert=True)
+            return
+        set_active_models(parsed)
+        safe_answer(call.id, f"Установлена {parsed[0]}")
+        text, markup = build_model_manager_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "model_custom":
+        if not is_admin(user_id):
+            safe_answer(call.id, "Нет прав.", show_alert=True)
+            return
+        clear_pending_modes(user_id)
+        set_awaiting_model(user_id)
+        safe_answer(call.id, "Отправь название модели")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="model_cancel"))
+        edit_or_send(
+            chat_id,
+            "✏️ <b>Ввод своей модели Gemini</b>\n\n"
+            "Отправь следующим сообщением точное название модели (например: "
+            "<code>gemini-3.5-flash-lite</code>) или несколько через запятую.",
+            reply_markup=markup,
+            message_id=edit_id,
+        )
+
+    elif data == "model_cancel":
+        if not is_admin(user_id):
+            safe_answer(call.id)
+            return
+        clear_awaiting_model(user_id)
+        safe_answer(call.id, "Отменено")
+        text, markup = build_model_manager_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "model_reset_cd":
+        if not is_admin(user_id):
+            safe_answer(call.id, "Нет прав.", show_alert=True)
+            return
+        reset_model_cooldowns()
+        safe_answer(call.id, "Паузы 404/429 сброшены!", show_alert=True)
+
+    elif data == "bc_cancel":
+        if not is_admin(user_id):
+            safe_answer(call.id)
+            return
+        clear_broadcast_state(user_id)
+        safe_answer(call.id, "Рассылка отменена")
+        try:
+            bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
+        except Exception:
+            pass
+        bot.send_message(chat_id, "❌ Рассылка отменена.")
+
+    elif data == "bc_send":
+        if not is_admin(user_id):
+            safe_answer(call.id)
+            return
+        with _broadcast_lock:
+            payload = _broadcast_state.pop(user_id, None)
+        if not payload or payload.get("step") != "ready":
+            safe_answer(call.id, "Нет активного черновика.", show_alert=True)
+            return
+        safe_answer(call.id, "Запускаю рассылку...")
+        try:
+            bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
+        except Exception:
+            pass
+        bot.send_message(chat_id, "🚀 Рассылка запущена в фоне...")
+        threading.Thread(target=_run_broadcast_worker, args=(chat_id, payload), daemon=True).start()
+
+    elif data.startswith("full_"):
+        photo_hash = data[5:]
+        if not re.fullmatch(r"p?[0-9a-f]{31,32}", photo_hash):
+            safe_answer(call.id, "Некорректный идентификатор отчёта.", show_alert=True)
+            return
+        cached = cache_get(photo_hash)
+        if cached and cached[1]:
+            safe_answer(call.id, "Загружаю разбор...")
+            title = "📐 Разбор бокового профиля" if photo_hash.startswith("p") else "💬 Подробный разбор"
+            send_long_html(chat_id, title, cached[1])
+        else:
+            safe_answer(call.id, "Разбор устарел, отправь фото заново.", show_alert=True)
+
+    elif data.startswith("growth_"):
+        photo_hash = data[7:]
+        if not re.fullmatch(r"[0-9a-f]{32}", photo_hash):
+            safe_answer(call.id, "Некорректный идентификатор отчёта.", show_alert=True)
+            return
+
+        _, pro_tier, _, _ = get_user_access(user_id)
+        if pro_tier <= 0 and not is_admin(user_id):
+            safe_answer(call.id, "Доступно в PRO")
+            markup = InlineKeyboardMarkup(row_width=1)
+            markup.add(InlineKeyboardButton("👑 Подключить PRO", callback_data="buy_menu"))
+            markup.add(InlineKeyboardButton("🤝 Получить PRO за друзей", callback_data="get_ref"))
+            bot.send_message(
+                chat_id,
+                "<b>📈 Персональный план роста (PRO)</b>\n\n"
+                "<blockquote>По результатам твоего скана бот составит пошаговый план:\n"
+                "• Топ-3 зоны роста с максимальным эффектом\n"
+                "• Подбор стрижки и щетины строго под твою форму лица\n"
+                "• Чек-лист по коже, бровям, отёчности и грумингу на 30 дней</blockquote>\n\n"
+                "Открывается на тарифах <b>PRO</b> или бесплатно за 3 приглашённых друзей.",
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+            return
+
+        cached = cache_get(photo_hash)
+        if not cached:
+            safe_answer(call.id, "Отчёт устарел, отправь фото заново.", show_alert=True)
+            return
+
+        scores_text, full_text, _, _, growth_plan = cached
+        if growth_plan:
+            safe_answer(call.id, "Загружаю план роста...")
+            send_long_html(chat_id, "📈 Персональный план роста (PRO)", growth_plan)
+            return
+
+        busy_key = (user_id, photo_hash)
+        with _growth_busy_lock:
+            if busy_key in _growth_busy:
+                safe_answer(call.id, "План уже составляется, подожди пару секунд...")
+                return
+            _growth_busy.add(busy_key)
+
+        safe_answer(call.id, "Составляю персональный план...")
+        status_msg = bot.send_message(chat_id, "📈 Составляю персональный план роста по твоим метрикам...")
+        threading.Thread(
+            target=_run_growth_plan_worker,
+            args=(chat_id, user_id, photo_hash, scores_text, full_text, status_msg),
+            daemon=True,
+        ).start()
+
+    else:
+        safe_answer(call.id)
+
+
+@bot.message_handler(content_types=["text"])
+def handle_fallback_text(message):
+    user_id = message.from_user.id
+    touch_user(message.from_user)
+    if is_user_banned(user_id):
+        return
+
+    if is_awaiting_promo(user_id):
+        clear_awaiting_promo(user_id)
+        ok, ptype, msg_text = activate_promocode_for_user(user_id, message.text)
+        markup = InlineKeyboardMarkup(row_width=1)
+        if ok and ptype == "discount":
+            markup.add(InlineKeyboardButton("💎 Перейти к тарифам со скидкой", callback_data="buy_menu"))
+        elif not ok:
+            markup.add(InlineKeyboardButton("🔁 Попробовать другой код", callback_data="enter_promo"))
+        markup.add(InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
+        bot.reply_to(message, msg_text, parse_mode="HTML", reply_markup=markup)
+        return
+
+    if is_awaiting_receipt(user_id):
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_pay"))
+        bot.reply_to(
+            message,
+            "📸 Жду <b>скриншот или PDF-чек</b> об оплате. Пришли его фото/файлом или нажми «Отмена».",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+    elif is_awaiting_profile(user_id):
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_profile"))
+        bot.reply_to(
+            message,
+            "📐 Сейчас активен режим <b>бокового профиля</b>. Пришли фото сбоку (90°) или нажми «Отмена».",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+
+
+if __name__ == "__main__":
+    init_db()
+    ensure_user_columns()
+    load_active_models_from_db()
+    setup_bot_commands()
+    start_scan_workers()
+    is_mediapipe_available()
+    uname = get_bot_username()
+    print(f"🚀 Adonis PSL Bot (@{uname or 'unknown'}) запущен!")
+
+    while True:
+        try:
+            bot.infinity_polling(
+                timeout=30,
+                long_polling_timeout=25,
+                skip_pending=True,
+            )
+        except KeyboardInterrupt:
+            print("🛑 Бот остановлен вручную.")
+            break
+        except Exception as e:
+            log_error(f"Сбой polling, перезапуск через 5 сек: {e}")
+            time.sleep(5) _media_group_lock = threading.Lock()
+_seen_media_groups = {}
+
+
+def _is_duplicate_media_group(user_id, media_group_id):
+    if not media_group_id:
+        return False
+    now = time.time()
+    key = (user_id, str(media_group_id))
+    with _media_group_lock:
+        if len(_seen_media_groups) > 500:
+            cutoff = now - 60.0
+            stale = [k for k, ts in _seen_media_groups.items() if ts < cutoff]
+            for k in stale:
+                del _seen_media_groups[k]
+        if key in _seen_media_groups and (now - _seen_media_groups[key]) < 30.0:
+            return True
+        _seen_media_groups[key] = now
+        return False
+
+
+def send_status_safe(message, text):
+    try:
+        return bot.reply_to(message, text)
+    except Exception:
+        try:
+            return bot.send_message(message.chat.id, text)
+        except Exception as e:
+            log_error(f"Не удалось отправить статус: {e}")
+            return None
+
+
+def delete_status_safe(chat_id, status_msg):
+    if not status_msg:
+        return
+    try:
+        bot.delete_message(chat_id, status_msg.message_id)
+    except Exception:
+        pass
+
+
+def safe_answer(call_id, text=None, show_alert=False):
+    try:
+        bot.answer_callback_query(call_id, text, show_alert=show_alert)
+    except Exception as e:
+        log_error(f"answer_callback_query: {e}")
+
+
+def edit_or_send(chat_id, text, reply_markup=None, message_id=None, parse_mode="HTML"):
+    if message_id:
+        try:
+            bot.edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=message_id,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+            return
+        except Exception as e:
+            if "message is not modified" in str(e).lower():
+                return
+    bot.send_message(
+        chat_id,
+        text,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True,
+    )
+
+
+def send_long_html(chat_id, title, text, limit=3500):
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if current and len(current) + len(line) + 1 > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
+
+    for i, chunk in enumerate(chunks):
+        header = f"<b>{html.escape(title)}</b>\n\n" if i == 0 else ""
+        try:
+            bot.send_message(chat_id, header + html.escape(chunk), parse_mode="HTML")
+        except Exception:
+            plain = f"{title}\n\n{chunk}" if i == 0 else chunk
+            bot.send_message(chat_id, plain, parse_mode=None)
+
+
+def is_image_document(message):
+    doc = getattr(message, "document", None)
+    if not doc:
+        return False
+    mime = (doc.mime_type or "").lower()
+    fname = (doc.file_name or "").lower()
+    return mime.startswith("image/") or fname.endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp"))
+
+
+def is_receipt_document(message):
+    if is_image_document(message):
+        return True
+    doc = getattr(message, "document", None)
+    if not doc:
+        return False
+    mime = (doc.mime_type or "").lower()
+    fname = (doc.file_name or "").lower()
+    return mime == "application/pdf" or fname.endswith(".pdf")
+
+
+def download_and_process_photo(message):
+    if message.photo:
+        file_obj = message.photo[-1]
+    elif message.document:
+        file_obj = message.document
+    else:
+        raise ValueError("Пришли фото лица.")
+
+    if (getattr(file_obj, "file_size", 0) or 0) > MAX_IMAGE_FILE_SIZE:
+        raise ValueError("Файл слишком большой (максимум 15 МБ).")
+
+    file_info = bot.get_file(file_obj.file_id)
+    if (file_info.file_size or 0) > MAX_IMAGE_FILE_SIZE:
+        raise ValueError("Файл слишком большой (максимум 15 МБ).")
+
+    raw_bytes = bot.download_file(file_info.file_path)
+    try:
+        with io.BytesIO(raw_bytes) as in_buf, Image.open(in_buf) as img:
+            img = ImageOps.exif_transpose(img)
+            if img.width < 64 or img.height < 64:
+                raise ValueError("Изображение слишком маленькое. Пришли чёткое фото лица.")
+            rgb = img.convert("RGB")
+            rgb.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+            with io.BytesIO() as out_buf:
+                rgb.save(out_buf, format="JPEG", quality=90, optimize=True)
+                return out_buf.getvalue()
+    except ValueError:
+        raise
+    except Image.DecompressionBombError:
+        raise ValueError("Изображение имеет слишком высокое разрешение.")
+    except Exception:
+        raise ValueError("Не удалось прочитать изображение. Пришли обычный JPG или PNG.")
+
+
+def setup_bot_commands():
+    default_commands = [
+        BotCommand("start", "Главное меню"),
+        BotCommand("buy", "Тарифы и сканы"),
+        BotCommand("ref", "Пригласить друга (+1 скан)"),
+        BotCommand("scale", "Шкала PSL 1.0–8.0"),
+        BotCommand("paysupport", "Поддержка"),
+    ]
+    admin_commands = default_commands + [
+        BotCommand("admin", "Шпаргалка по админке"),
+        BotCommand("model", "Сменить модель Gemini"),
+    ]
+    try:
+        bot.set_my_commands(default_commands, scope=BotCommandScopeDefault())
+        for admin_id in ADMIN_IDS:
+            bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
+    except Exception as e:
+        log_error(f"Не удалось выставить меню команд: {e}")
+
+
+def format_user_status_short(user_id):
+    free_limit, pro_tier, pro_until, _ = get_user_access(user_id)
+    if is_admin(user_id):
+        return "👑 <b>Администратор</b> • без лимитов"
+    extra_str = f" (+{free_limit} доп.)" if free_limit > 0 else ""
+    if pro_tier >= 2:
+        left = get_pro_remaining_today(user_id, pro_tier)
+        return f"💎 <b>PRO Навсегда</b> • сегодня {left}/{PRO_LIFE_DAILY_LIMIT}{extra_str}"
+    if pro_tier == 1:
+        left = get_pro_remaining_today(user_id, pro_tier)
+        until_str = format_date_from_ts(pro_until) if pro_until > 0 else "—"
+        return f"👑 <b>PRO до {until_str}</b> • сегодня {left}/{PRO30_DAILY_LIMIT}{extra_str}"
+    return f"⚡ <b>Базовый</b> • доступно сканов: <b>{free_limit}</b>"
+
+
+def format_score_delta(delta):
+    if delta is None:
+        return ""
+    if delta > 0.05:
+        return f"📈 +{delta:.1f} к прошлому скану"
+    if delta < -0.05:
+        return f"📉 {delta:.1f} к прошлому скану"
+    return "➖ без изменений к прошлому скану"
+
+
+def preview_score_delta(user_id, new_score):
+    if new_score is None:
+        return None
+    _, best_score, _, _, _, _, last_score, _ = get_user_profile_stats(user_id)
+    ref_score = last_score if last_score > 0.0 else best_score
+    if ref_score <= 0.0:
+        return None
+    return round(float(new_score) - float(ref_score), 1)
+
+
+def build_main_menu_view(user_id):
+    free_limit, pro_tier, _, _ = get_user_access(user_id)
+    status_line = format_user_status_short(user_id)
+    scans_cnt, best_score, _, _, _, _, last_score, prev_score = get_user_profile_stats(user_id)
+    best_line = f" • Лучший балл: <b>{best_score:.1f}/8</b>" if best_score > 0 else ""
+    delta_line = ""
+    if last_score > 0 and prev_score > 0:
+        d_txt = format_score_delta(round(last_score - prev_score, 1))
+        if d_txt:
+            delta_line = f"\nПоследний скан: <b>{last_score:.1f}/8</b> ({d_txt})"
+
+    sub_hint = ""
+    if (
+        not is_admin(user_id)
+        and pro_tier == 0
+        and free_limit <= 0
+        and is_channel_bonus_enabled()
+        and not is_channel_bonus_claimed(user_id)
+    ):
+        sub_hint = (
+            f"\n\n🎁 <b>Получи +{CHANNEL_SUB_BONUS} бесплатный скан:</b> "
+            "подпишись на наш канал кнопкой ниже!"
+        )
+
+    text = (
+        "<b>ADONIS PSL • Биометрия лица</b>\n\n"
+        f"<blockquote>{status_line}\n"
+        f"Сканов выполнено: <b>{scans_cnt}</b>{best_line}{delta_line}</blockquote>\n\n"
+        "Просто отправь <b>фото анфас</b> при ровном свете — бот замерит пропорции "
+        f"и соберёт карточку-отчёт по шкале 1.0–8.0.{sub_hint}"
+    )
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("📸 Анализ анфас", callback_data="scan_front_tip"),
+        InlineKeyboardButton("📐 Профиль (PRO)", callback_data="profile_scan"),
+    )
+    markup.add(
+        InlineKeyboardButton("👤 Мой профиль", callback_data="my_profile"),
+        InlineKeyboardButton("💎 Тарифы и сканы", callback_data="buy_menu"),
+    )
+    markup.add(
+        InlineKeyboardButton("🤝 Пригласить друга", callback_data="get_ref"),
+        InlineKeyboardButton("📖 Шкала PSL", callback_data="psl_scale"),
+    )
+    if is_channel_bonus_enabled() and not is_channel_bonus_claimed(user_id):
+        markup.add(
+            InlineKeyboardButton(
+                f"📢 +{CHANNEL_SUB_BONUS} скан за подписку",
+                callback_data="channel_bonus",
+            ),
+            InlineKeyboardButton("🆘 Поддержка", callback_data="support_menu"),
+        )
+    else:
+        markup.add(InlineKeyboardButton("🆘 Поддержка", callback_data="support_menu"))
+    return text, markup
+
+
+def build_psl_scale_view():
+    text = (
+        "<b>📖 Шкала PSL (1.0–8.0)</b>\n\n"
+        "<blockquote>"
+        "• <b>1.0–2.4</b> — <b>Саб 3</b> <i>(нижние ~5%)</i>\n"
+        "• <b>2.5–2.9</b> — <b>Саб 5</b> <i>(ниже среднего)</i>\n"
+        "• <b>3.0–3.4</b> — <b>Лтн</b> <i>(нижняя граница нормы)</i>\n"
+        "• <b>3.5–3.9</b> — <b>Мтн</b> <i>(средняя норма, ~50-й процентиль)</i>\n"
+        "• <b>4.0–4.4</b> — <b>Мхтн</b> <i>(выше среднего)</i>\n"
+        "• <b>4.5–4.9</b> — <b>Хмтн</b> <i>(верхние ~20%)</i>\n"
+        "• <b>5.0–5.4</b> — <b>Хтн</b> <i>(верхние ~10%)</i>\n"
+        "• <b>5.5–6.4</b> — <b>Лоу чад лайт</b> <i>(модельный уровень, топ ~3%)</i>\n"
+        "• <b>6.5–6.9</b> — <b>Чад лайт</b> <i>(сильный модельный, топ ~1%)</i>\n"
+        "• <b>7.0–8.0</b> — <b>Чад</b> <i>(элитный мировой уровень, топ &lt;0.2%)</i>"
+        "</blockquote>\n\n"
+        "<b>📸 Как получить точный замер:</b>\n"
+        "• Основная камера на уровне глаз с расстояния ~1–1.5 м (без широкоугольных искажений)\n"
+        "• Ровный фронтальный дневной свет, нейтральное лицо, без фильтров и очков"
+    )
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("📸 Сделать скан", callback_data="scan_front_tip"),
+        InlineKeyboardButton("👤 Мой профиль", callback_data="my_profile"),
+    )
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def build_profile_cabinet_view(user_id):
+    status_line = format_user_status_short(user_id)
+    scans_cnt, best_score, ref_count, _, _, _, last_score, prev_score = get_user_profile_stats(user_id)
+    best_str = f"<b>{best_score:.1f}/8</b> ({category_by_score(best_score)})" if best_score > 0 else "ещё нет"
+
+    last_line = ""
+    if last_score > 0:
+        delta_txt = format_score_delta(round(last_score - prev_score, 1)) if prev_score > 0 else ""
+        delta_part = f" • {delta_txt}" if delta_txt else ""
+        last_line = f"\nПоследний скан: <b>{last_score:.1f}/8</b>{delta_part}"
+
+    promo_code, discount_pct = get_user_active_discount(user_id)
+    promo_line = (
+        f"\nАктивный промокод: <code>{html.escape(promo_code)}</code> (<b>-{discount_pct}%</b>)"
+        if promo_code
+        else ""
+    )
+
+    uname = get_bot_username()
+    ref_block = (
+        f"\n🔗 Реф-ссылка:\n<code>https://t.me/{uname}?start=ref_{user_id}</code>"
+        if uname
+        else ""
+    )
+
+    text = (
+        "<b>👤 Мой профиль</b>\n\n"
+        f"<blockquote>{status_line}\n"
+        f"ID: <code>{user_id}</code>\n"
+        f"Всего сканов: <b>{scans_cnt}</b>\n"
+        f"Лучший результат: {best_str}{last_line}\n"
+        f"Приглашено друзей: <b>{ref_count}</b>{promo_line}</blockquote>"
+        f"{ref_block}"
+    )
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("💎 Пополнить / PRO", callback_data="buy_menu"),
+        InlineKeyboardButton("🎁 Промокод", callback_data="enter_promo"),
+    )
+    markup.add(
+        InlineKeyboardButton("🤝 Рефералка", callback_data="get_ref"),
+        InlineKeyboardButton("📖 Шкала PSL", callback_data="psl_scale"),
+    )
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def build_buy_menu_view(user_id=None):
+    promo_code, discount_pct = get_user_active_discount(user_id) if user_id is not None else ("", 0)
+    promo_banner = (
+        f"🎁 <b>Активна скидка -{discount_pct}%</b> по промокоду <code>{html.escape(promo_code)}</code>!\n\n"
+        if promo_code
+        else ""
+    )
+
+    lines = []
+    for plan_id, plan in PLANS.items():
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        if pr["discount_pct"] > 0:
+            price_txt = (
+                f"<s>{pr['orig_stars']} ⭐</s> <b>{pr['stars']} ⭐</b> / "
+                f"<s>{pr['orig_rub']} ₽</s> <b>{pr['rub']} ₽</b>"
+            )
+        else:
+            price_txt = f"{pr['stars']} ⭐ / {pr['rub']} ₽"
+
+        if plan_id == "pack15":
+            lines.append(f"• <b>{html.escape(plan['title'])}</b> — {price_txt} <i>(выгоднее)</i>")
+        elif plan_id == "pro30":
+            lines.append(
+                f"• <b>{html.escape(plan['title'])}</b> — {price_txt}\n"
+                f"  <i>{PRO30_DAILY_LIMIT} сканов/день + профиль + план роста + приоритет</i>"
+            )
+        elif plan_id == "pro_life":
+            lines.append(
+                f"• <b>{html.escape(plan['title'])}</b> — {price_txt}\n"
+                f"  <i>{PRO_LIFE_DAILY_LIMIT} сканов/день + профиль + план роста + топ-приоритет</i>"
+            )
+        else:
+            lines.append(f"• <b>{html.escape(plan['title'])}</b> — {price_txt}")
+
+    text = (
+        "<b>💎 Тарифы и сканы</b>\n\n"
+        f"{promo_banner}"
+        "<blockquote>" + "\n".join(lines) + "</blockquote>\n\n"
+        "Оплата через <b>Telegram Stars</b> активируется мгновенно."
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    for plan_id, plan in PLANS.items():
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        disc_tag = f" (-{pr['discount_pct']}%)" if pr["discount_pct"] > 0 else ""
+        markup.add(
+            InlineKeyboardButton(
+                f"{plan['title']} — {pr['stars']} ⭐ / {pr['rub']} ₽{disc_tag}",
+                callback_data=f"plan_{plan_id}",
+            )
+        )
+    markup.add(InlineKeyboardButton("🎁 Ввести промокод", callback_data="enter_promo"))
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def _build_progress_bar(current, target, width=10):
+    ratio = max(0.0, min(1.0, current / max(1, target)))
+    filled = int(round(ratio * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+def build_ref_view(user_id):
+    username = get_bot_username()
+    if not username:
+        return "⏳ Не удалось сформировать ссылку. Попробуй через пару секунд.", InlineKeyboardMarkup()
+
+    _, _, ref_count, _, _, _, _, _ = get_user_profile_stats(user_id)
+    ref_link = f"https://t.me/{username}?start=ref_{user_id}"
+    share_text = "Оцени внешность по 8-балльной шкале в Adonis PSL:"
+    share_url = f"https://t.me/share/url?url={quote(ref_link)}&text={quote(share_text)}"
+
+    ladder_lines = []
+    next_target = None
+    for req_refs, pro_days in REF_MILESTONES:
+        if ref_count >= req_refs:
+            ladder_lines.append(f"✅ <b>{req_refs} друзей</b> → PRO на {pro_days} дн.")
+        else:
+            if next_target is None:
+                next_target = (req_refs, pro_days)
+            ladder_lines.append(f"🔒 <b>{req_refs} друзей</b> → PRO на {pro_days} дн.")
+
+    if next_target:
+        req_refs, pro_days = next_target
+        bar = _build_progress_bar(ref_count, req_refs, width=10)
+        left = req_refs - ref_count
+        progress_txt = (
+            f"\nДо <b>PRO на {pro_days} дн.</b>: <code>[{bar}]</code> "
+            f"<b>{ref_count}/{req_refs}</b> (осталось {left})"
+        )
+    else:
+        progress_txt = "\n🏆 <b>Все ступени реферальной лестницы пройдены!</b>"
+
+    text = (
+        "<b>🤝 Пригласить друга</b>\n\n"
+        f"<blockquote>За каждого нового пользователя по твоей ссылке начисляется "
+        f"<b>+{REFERRAL_BONUS} бесплатный скан</b>.\n"
+        f"Приглашено друзей: <b>{ref_count}</b>{progress_txt}</blockquote>\n\n"
+        "<b>🏆 Реферальная лестница:</b>\n"
+        + "\n".join(ladder_lines)
+        + f"\n\nТвоя ссылка (нажми, чтобы скопировать):\n<code>{html.escape(ref_link)}</code>"
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("📤 Поделиться ссылкой", url=share_url))
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def build_channel_bonus_view():
+    url = get_channel_url()
+    text = (
+        f"<b>📢 Бонус +{CHANNEL_SUB_BONUS} бесплатный скан</b>\n\n"
+        "<blockquote>Подпишись на наш официальный Telegram-канал с обновлениями, разборами и промокодами, "
+        "затем нажми кнопку проверки ниже.</blockquote>"
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    if url:
+        markup.add(InlineKeyboardButton("📣 Перейти в канал", url=url))
+    markup.add(InlineKeyboardButton("✅ Проверить подписку", callback_data="check_sub"))
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def build_support_view():
+    support_url = get_support_url()
+    text = (
+        "<b>🆘 Поддержка</b>\n\n"
+        "<blockquote>Оплата через Telegram Stars начисляется автоматически за 1 секунду. "
+        "Перевод на карту (только РФ) подтверждается администратором после проверки чека.</blockquote>\n\n"
+        "Если возник вопрос по оплате или работе бота — напиши напрямую администратору:"
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    if support_url:
+        markup.add(InlineKeyboardButton("💬 Написать администратору", url=support_url))
+    markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+    return text, markup
+
+
+def send_adult_confirm(chat_id):
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("✅ Мне есть 18 лет", callback_data="confirm_18"))
+    bot.send_message(
+        chat_id,
+        "Доступ к оценке внешности разрешён только пользователям 18+.\n"
+        "Подтверди свой возраст кнопкой ниже:",
+        reply_markup=markup,
+    )
+
+
+def parse_referrer_id(text):
+    parts = (text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    m = re.match(r"^ref_(\d+)$", parts[1].strip())
+    return int(m.group(1)) if m else None
+
+
+def parse_start_promo(text):
+    parts = (text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    m = re.match(r"^promo_([A-Za-z0-9_\-]{2,24})$", parts[1].strip())
+    return m.group(1).upper() if m else None
+
+
+@bot.message_handler(commands=["start"])
+def cmd_start(message):
+    user_id = message.from_user.id
+    clear_pending_modes(user_id)
+    if is_user_banned(user_id):
+        bot.send_message(message.chat.id, "⛔ Доступ к боту ограничен.")
+        return
+    if not check_rate_limit(user_id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+
+    referrer_id = parse_referrer_id(message.text)
+    start_promo = parse_start_promo(message.text)
+    rewarded_referrer, milestone_msg = register_user_if_new(message.from_user, referrer_id=referrer_id)
+    if rewarded_referrer:
+        try:
+            ref_notice = (
+                f"🎉 По твоей ссылке присоединился новый пользователь!\n"
+                f"Начислен бонус: <b>+{REFERRAL_BONUS} бесплатный скан</b>."
+            )
+            if milestone_msg:
+                ref_notice += f"\n\n{milestone_msg}"
+            bot.send_message(rewarded_referrer, ref_notice, parse_mode="HTML")
+        except Exception as e:
+            log_error(f"Не удалось уведомить реферера {rewarded_referrer}: {e}")
+
+    if start_promo:
+        _, _, promo_msg = activate_promocode_for_user(user_id, start_promo)
+        bot.send_message(message.chat.id, promo_msg, parse_mode="HTML")
+
+    _, _, _, is_adult = get_user_access(user_id)
+    text, markup = build_main_menu_view(user_id)
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+    if not is_adult and not is_admin(user_id):
+        send_adult_confirm(message.chat.id)
+
+
+@bot.message_handler(commands=["buy"])
+def cmd_buy(message):
+    touch_user(message.from_user)
+    if is_user_banned(message.from_user.id):
+        return
+    if not check_rate_limit(message.from_user.id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+    clear_pending_modes(message.from_user.id)
+    text, markup = build_buy_menu_view(message.from_user.id)
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.message_handler(commands=["ref"])
+def cmd_ref(message):
+    touch_user(message.from_user)
+    if is_user_banned(message.from_user.id):
+        return
+    if not check_rate_limit(message.from_user.id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+    clear_pending_modes(message.from_user.id)
+    text, markup = build_ref_view(message.from_user.id)
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.message_handler(commands=["scale"])
+def cmd_scale(message):
+    touch_user(message.from_user)
+    if is_user_banned(message.from_user.id):
+        return
+    if not check_rate_limit(message.from_user.id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+    clear_pending_modes(message.from_user.id)
+    text, markup = build_psl_scale_view()
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.message_handler(commands=["paysupport"])
+def cmd_paysupport(message):
+    touch_user(message.from_user)
+    if is_user_banned(message.from_user.id):
+        return
+    if not check_rate_limit(message.from_user.id, "cmd", min_interval=1.0, max_per_min=15):
+        return
+    clear_pending_modes(message.from_user.id)
+    text, markup = build_support_view()
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+
+def get_admin_help_text():
+    return (
+        "<b>👑 Админ-команды (через точку)</b>\n\n"
+        "<blockquote>"
+        "• <code>. создать промокод 10% ADONIS 50 24ч</code> — создать промо\n"
+        "  <i>Награда: 10% / 2скана / 3pro | лимит и время (30м/24ч/7д) опц.</i>\n"
+        "• <code>. промокоды</code> — список промокодов и активаций\n"
+        "• <code>. удалить промокод ADONIS</code> — отключить промокод\n"
+        "• <code>. выдать всем 1</code> — выдать +N сканов всем пользователям\n"
+        "• <code>. забрать у всех 1</code> / <code>все</code> — списать N (или все) сканы у всех\n"
+        "• <code>. забрать стартовый</code> — забрать 1 неиспользованный старт-скан у новичков\n"
+        "• <code>. выдать сканы @user 10</code> / <code>. забрать сканы @user 5</code>\n"
+        "• <code>. выдать премиум @user 30</code> / <code>навсегда</code>\n"
+        "• <code>. забрать премиум @user</code> — снять PRO\n"
+        "• <code>. модель</code> — меню смены модели Gemini (или <code>. модель имя</code>)\n"
+        "• <code>. стата</code> — сводка по боту (+ сканы за сегодня)\n"
+        "• <code>. юзеры [15]</code> — последние пользователи и их активность\n"
+        "• <code>. инфо @user</code> — досье по юзеру\n"
+        "• <code>. рассылка</code> — рассылка с предпросмотром\n"
+        "• <code>. бан @user</code> / <code>. разбан @user</code>\n"
+        "• <code>. очистить кэш</code> — сбросить кэш фото\n"
+        "• <code>. админ</code> — эта шпаргалка"
+        "</blockquote>\n\n"
+        "Вместо <code>@user</code> можно указывать числовой <code>ID</code>."
+    )
+
+
+def build_model_manager_view():
+    active = get_active_models()
+    active_str = "\n".join(f"• <code>{html.escape(m)}</code>" for m in active)
+    text = (
+        "<b>🤖 Управление моделью Gemini</b>\n\n"
+        f"<blockquote>Активная сейчас:\n{active_str}</blockquote>\n\n"
+        "Выбери быстрый пресет кнопкой ниже, введи свою модель вручную "
+        "или напиши команду:\n"
+        "<code>. модель gemini-3.5-flash-lite</code>\n"
+        "<i>Можно указать несколько через запятую (запасной фолбэк).</i>"
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    for preset in PRESET_MODELS:
+        prefix = "✅ " if active == [preset] else ""
+        markup.add(InlineKeyboardButton(f"{prefix}{preset}", callback_data=f"setmodel_{preset}"))
+    markup.add(InlineKeyboardButton("✏️ Ввести свою модель", callback_data="model_custom"))
+    markup.add(InlineKeyboardButton("🔄 Сбросить паузу 404/429", callback_data="model_reset_cd"))
+    markup.add(InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
+    return text, markup
+
+
+def get_bot_stats_text():
+    now = int(time.time())
+    today = get_today_str()
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        total = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE date(created_at, 'localtime') = ?", (today,))
+        new_today = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(pro_tier, 0) = 1 AND pro_until > ?", (now,))
+        pro30_cnt = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(pro_tier, 0) >= 2")
+        pro_life_cnt = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(is_banned, 0) = 1")
+        banned_cnt = c.fetchone()[0]
+        c.execute("SELECT COALESCE(SUM(scans_count), 0), COALESCE(SUM(referrals_count), 0) FROM users")
+        total_scans, total_refs = c.fetchone()
+        c.execute("SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM stars_payments")
+        stars_cnt, stars_sum = c.fetchone()
+        c.execute("SELECT COUNT(*) FROM payment_requests WHERE status = 'approved'")
+        card_cnt = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM photo_cache")
+        cached = c.fetchone()[0]
+        c.execute("SELECT COALESCE(scans, 0) FROM daily_stats WHERE day = ?", (today,))
+        row_today = c.fetchone()
+        scans_today = row_today[0] if row_today else 0
+        c.execute(
+            """
+            SELECT COUNT(*) FROM promocodes
+            WHERE is_active = 1
+              AND (expires_at = 0 OR expires_at > ?)
+              AND (max_uses = 0 OR used_count < max_uses)
+            """,
+            (now,),
+        )
+        active_promos = c.fetchone()[0]
+
+    mp_status = "✅ активен" if is_mediapipe_available() else "⚠️ визуальный режим"
+    models_str = ", ".join(get_active_models())
+    return (
+        "<b>📊 Статистика ADONIS PSL</b>\n\n"
+        "<blockquote>"
+        f"Пользователей: <b>{total}</b> (новых сегодня: <b>+{new_today}</b>)\n"
+        f"PRO 30д: <b>{pro30_cnt}</b> | PRO Навсегда: <b>{pro_life_cnt}</b> | Бан: <b>{banned_cnt}</b>\n"
+        f"Всего сканов: <b>{total_scans}</b> (сегодня: <b>+{scans_today}</b>) | Рефералов: <b>{total_refs}</b>\n"
+        f"Stars: <b>{stars_cnt}</b> ({stars_sum} ⭐) | Картой: <b>{card_cnt}</b>\n"
+        f"Очередь: <b>{_scan_queue.qsize()}</b> | Кэш фото: <b>{cached}</b> | Промо: <b>{active_promos}</b>\n"
+        f"Модели: <code>{html.escape(models_str)}</code>\n"
+        f"MediaPipe 468 точек: <b>{mp_status}</b>"
+        "</blockquote>"
+    )
+
+
+def build_user_dossier_text(target_id):
+    free_limit, pro_tier, pro_until, is_adult = get_user_access(target_id)
+    scans_cnt, best_score, ref_count, uname, fname, banned, last_score, prev_score = get_user_profile_stats(target_id)
+
+    extra_str = f" + {free_limit} доп." if free_limit > 0 else ""
+    if pro_tier >= 2:
+        tier_str = f"💎 PRO Навсегда (сегодня {get_pro_remaining_today(target_id, pro_tier)}/{PRO_LIFE_DAILY_LIMIT}{extra_str})"
+    elif pro_tier == 1:
+        tier_str = f"👑 PRO до {format_date_from_ts(pro_until)} (сегодня {get_pro_remaining_today(target_id, pro_tier)}/{PRO30_DAILY_LIMIT}{extra_str})"
+    else:
+        tier_str = f"⚡ Базовый (сканов: {free_limit})"
+
+    uname_str = f"@{uname}" if uname else "нет"
+    ban_str = "⛔ Забанен" if banned else "✅ Активен"
+    best_str = f"{best_score:.1f}/8" if best_score > 0 else "—"
+    last_str = f"{last_score:.1f}/8" if last_score > 0 else "—"
+    if last_score > 0 and prev_score > 0:
+        d = round(last_score - prev_score, 1)
+        last_str += f" ({d:+.1f})"
+
+    return (
+        f"<b>🗂 Досье пользователя</b>\n\n"
+        "<blockquote>"
+        f"ID: <code>{target_id}</code>\n"
+        f"Username: {html.escape(uname_str)}\n"
+        f"Имя: {html.escape(fname or '—')}\n"
+        f"Статус: {ban_str} | 18+: {'да' if is_adult else 'нет'}\n"
+        f"Тариф: {tier_str}\n"
+        f"Сканов всего: <b>{scans_cnt}</b> | Лучший: <b>{best_str}</b> | Последний: <b>{last_str}</b>\n"
+        f"Рефералов: <b>{ref_count}</b>"
+        "</blockquote>"
+    )
+
+
+@bot.message_handler(commands=["admin"])
+def cmd_admin_slash(message):
+    if is_admin(message.from_user.id):
+        bot.reply_to(message, get_admin_help_text(), parse_mode="HTML")
+
+
+@bot.message_handler(commands=["model", "models"])
+def cmd_model_slash(message):
+    if not is_admin(message.from_user.id):
+        return
+    clear_pending_modes(message.from_user.id)
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 2 and parts[1].strip():
+        arg = parts[1].strip()
+        if arg.lower() in ("сброс", "reset", "default"):
+            saved = set_active_models(DEFAULT_MODELS)
+            bot.reply_to(
+                message,
+                f"✅ Модель сброшена на стандартную: <code>{html.escape(', '.join(saved))}</code>",
+                parse_mode="HTML",
+            )
+            return
+        parsed = parse_models_input(arg)
+        if not parsed:
+            bot.reply_to(
+                message,
+                "⚠️ Некорректное имя модели. Пример: <code>/model gemini-3.5-flash-lite</code>",
+                parse_mode="HTML",
+            )
+            return
+        saved = set_active_models(parsed)
+        bot.reply_to(
+            message,
+            f"✅ Активная модель обновлена:\n<code>{html.escape(', '.join(saved))}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    text, markup = build_model_manager_view()
+    bot.reply_to(message, text, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.message_handler(commands=["stats"])
+def cmd_stats_slash(message):
+    if is_admin(message.from_user.id):
+        bot.reply_to(message, get_bot_stats_text(), parse_mode="HTML")
+
+
+@bot.message_handler(commands=["clear_cache"])
+def cmd_clear_cache_slash(message):
+    if not is_admin(message.from_user.id):
+        return
+    with db_conn() as conn:
+        conn.cursor().execute("DELETE FROM photo_cache")
+    bot.reply_to(message, "✅ Кэш фото очищен.")
+
+
+@bot.message_handler(
+    func=lambda m: bool(
+        m.text
+        and m.text.lstrip().startswith(".")
+        and is_admin(m.from_user.id)
+        and not is_awaiting_broadcast(m.from_user.id)
+        and not is_awaiting_model(m.from_user.id)
+        and not is_awaiting_promo(m.from_user.id)
+    ),
+    content_types=["text"],
+)
+def handle_admin_dot_commands(message):
+    user_id = message.from_user.id
+    body = re.sub(r"\s+", " ", message.text.lstrip()[1:].strip())
+    low = body.lower()
+
+    if low in ("админ", "admin", "помощь", "help"):
+        bot.reply_to(message, get_admin_help_text(), parse_mode="HTML")
+        return
+
+    if low in ("стата", "статистика", "stats"):
+        bot.reply_to(message, get_bot_stats_text(), parse_mode="HTML")
+        return
+
+    m_users = re.match(r"^(?:юзеры|пользователи|users)(?:\s+(\d+))?$", body, flags=re.IGNORECASE)
+    if m_users:
+        lim = max(1, min(30, int(m_users.group(1)))) if m_users.group(1) else 15
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                """
+                SELECT user_id, COALESCE(username, ''), COALESCE(first_name, ''),
+                       COALESCE(free_limit, 0), COALESCE(pro_tier, 0),
+                       COALESCE(scans_count, 0), COALESCE(best_score, 0.0)
+                FROM users
+                ORDER BY created_at DESC, user_id DESC
+                LIMIT ?
+                """,
+                (lim,),
+            )
+            rows = c.fetchall()
+        if not rows:
+            bot.reply_to(message, "Пользователей пока нет.")
+            return
+        lines = []
+        for uid, uname, fname, flim, ptier, scnt, bscore in rows:
+            tag = f"@{uname}" if uname else (fname or str(uid))
+            tier_icon = "💎" if ptier >= 2 else ("👑" if ptier == 1 else "⚡")
+            score_part = f" | max {bscore:.1f}" if bscore > 0 else ""
+            lines.append(
+                f"{tier_icon} <code>{uid}</code> ({html.escape(tag[:20])}) — "
+                f"баланс: <b>{flim}</b> | сканов: <b>{scnt}</b>{score_part}"
+            )
+        bot.reply_to(
+            message,
+            f"<b>👥 Последние {len(rows)} пользователей</b>\n\n<blockquote>" + "\n".join(lines) + "</blockquote>",
+            parse_mode="HTML",
+        )
+        return
+
+    m_give_all = re.match(
+        r"^выдать\s+всем(?:\s+(?:сканы|сканов|рейты|рейтов))?\s+(\d+)$",
+        body,
+        flags=re.IGNORECASE,
+    )
+    if m_give_all:
+        amount = int(m_give_all.group(1))
+        if amount <= 0 or amount > 1000:
+            bot.reply_to(message, "⚠️ Укажи число от 1 до 1000.")
+            return
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                "UPDATE users SET free_limit = free_limit + ? WHERE COALESCE(is_banned, 0) = 0",
+                (amount,),
+            )
+            affected = c.rowcount
+        bot.reply_to(
+            message,
+            f"✅ Выдано <b>+{amount} сканов</b> всем активным пользователям (затронуто: <b>{affected}</b>).",
+            parse_mode="HTML",
+        )
+        return
+
+    m_take_all = re.match(
+        r"^(?:забрать\s+у\s+всех|списать\s+у\s+всех)(?:\s+(?:сканы|сканов|рейты|рейтов))?\s+(\S+)$",
+        body,
+        flags=re.IGNORECASE,
+    )
+    if m_take_all:
+        arg = m_take_all.group(1).lower()
+        if arg in ("все", "всё", "all", "0"):
+            with db_conn() as conn:
+                c = conn.cursor()
+                c.execute("UPDATE users SET free_limit = 0 WHERE free_limit > 0")
+                affected = c.rowcount
+            bot.reply_to(
+                message,
+                f"🗑 Все сканы (free_limit) обнулены у <b>{affected}</b> пользователей.",
+                parse_mode="HTML",
+            )
+            return
+        if not arg.isdigit() or int(arg) <= 0:
+            bot.reply_to(
+                message,
+                "⚠️ Укажи число (> 0) или слово <code>все</code>. Пример: <code>. забрать у всех 1</code>",
+                parse_mode="HTML",
+            )
+            return
+        amount = int(arg)
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                "UPDATE users SET free_limit = MAX(0, free_limit - ?) WHERE free_limit > 0",
+                (amount,),
+            )
+            affected = c.rowcount
+        bot.reply_to(
+            message,
+            f"✅ Списано до <b>-{amount} сканов</b> у всех пользователей с балансом (затронуто: <b>{affected}</b>).",
+            parse_mode="HTML",
+        )
+        return
+
+    if low in ("забрать стартовый", "снять стартовый"):
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                """
+                UPDATE users
+                SET free_limit = MAX(0, free_limit - 1)
+                WHERE free_limit > 0
+                  AND COALESCE(scans_count, 0) = 0
+                  AND COALESCE(pro_tier, 0) = 0
+                  AND COALESCE(channel_bonus_claimed, 0) = 0
+                  AND COALESCE(referrals_count, 0) = 0
+                """
+            )
+            affected = c.rowcount
+        bot.reply_to(
+            message,
+            f"✅ Неиспользованный стартовый скан списан у <b>{affected}</b> новичков "
+            "(подписчики ТГК, реферальные и купленные сканы не затронуты).",
+            parse_mode="HTML",
+        )
+        return
+
+    if low in ("очистить кэш", "кэш", "clear_cache"):
+        with db_conn() as conn:
+            conn.cursor().execute("DELETE FROM photo_cache")
+        bot.reply_to(message, "✅ Кэш фото очищен.")
+        return
+
+    if low in ("промокоды", "промо", "promos"):
+        rows = list_promocodes_db(limit=25)
+        if not rows:
+            bot.reply_to(
+                message,
+                "🎁 Промокодов пока нет.\n"
+                "Создать: <code>. создать промокод 10% ADONIS 50 24ч</code>",
+                parse_mode="HTML",
+            )
+            return
+        now = int(time.time())
+        lines = []
+        for code, ptype, val, max_u, used_c, exp_at, is_act in rows:
+            expired = bool(exp_at > 0 and now >= exp_at)
+            exhausted = bool(max_u > 0 and used_c >= max_u)
+            icon = "✅" if (is_act and not expired and not exhausted) else "⛔"
+            lim_str = f"{used_c}/{max_u}" if max_u > 0 else f"{used_c}/∞"
+            time_str = format_time_left(exp_at)
+            lines.append(
+                f"{icon} <code>{html.escape(code)}</code> — {format_promo_reward(ptype, val)} "
+                f"| {lim_str} | {time_str}"
+            )
+        bot.reply_to(
+            message,
+            "<b>🎁 Промокоды</b>\n\n<blockquote>" + "\n".join(lines) + "</blockquote>",
+            parse_mode="HTML",
+        )
+        return
+
+    m_del_promo = re.match(r"^(?:удалить|отключить)\s+промокод\s+(\S+)$", body, flags=re.IGNORECASE)
+    if m_del_promo:
+        code = m_del_promo.group(1).strip().upper()
+        if deactivate_promocode_db(code):
+            bot.reply_to(message, f"🗑 Промокод <code>{html.escape(code)}</code> отключён.", parse_mode="HTML")
+        else:
+            bot.reply_to(message, f"⚠️ Промокод <code>{html.escape(code)}</code> не найден.", parse_mode="HTML")
+        return
+
+    m_new_promo = re.match(r"^создать\s+промокод\s+(.+)$", body, flags=re.IGNORECASE)
+    if m_new_promo:
+        tokens = m_new_promo.group(1).strip().split()
+        if len(tokens) < 2:
+            bot.reply_to(
+                message,
+                "⚠️ Формат: <code>. создать промокод 10% ADONIS [лимит] [время]</code>\n"
+                "Примеры:\n"
+                "• <code>. создать промокод 10% ADONIS 50 24ч</code>\n"
+                "• <code>. создать промокод 2скана START 100 7д</code>\n"
+                "• <code>. создать промокод 3pro VIP 20</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        ptype, pval = parse_promo_reward_token(tokens[0])
+        if not ptype:
+            bot.reply_to(
+                message,
+                "⚠️ Некорректная награда. Укажи: <code>10%</code> (1–90%), <code>2скана</code> или <code>3pro</code>.",
+                parse_mode="HTML",
+            )
+            return
+
+        code = tokens[1].strip().upper()
+        if not re.fullmatch(r"[A-Z0-9_\-]{2,24}", code):
+            bot.reply_to(
+                message,
+                "⚠️ Код должен быть длиной 2–24 символа (только латиница, цифры, _ или -).",
+                parse_mode="HTML",
+            )
+            return
+
+        max_uses = 0
+        duration_sec = 0
+        for extra in tokens[2:]:
+            if extra.isdigit():
+                max_uses = int(extra)
+                continue
+            parsed_dur = parse_promo_duration_token(extra)
+            if parsed_dur is not None:
+                duration_sec = parsed_dur
+                continue
+            bot.reply_to(
+                message,
+                f"⚠️ Не понял параметр <code>{html.escape(extra)}</code>.\n"
+                "Лимит — число (например <code>50</code>), время — <code>30м</code>, <code>24ч</code> или <code>7д</code>.",
+                parse_mode="HTML",
+            )
+            return
+
+        expires_at = create_promocode_db(code, ptype, pval, max_uses=max_uses, duration_sec=duration_sec)
+        uname = get_bot_username()
+        link_line = (
+            f"\nСсылка автоактивации:\n<code>https://t.me/{uname}?start=promo_{code}</code>"
+            if uname
+            else ""
+        )
+        lim_txt = f"{max_uses} активаций" if max_uses > 0 else "безлимит"
+        exp_txt = f"до {format_datetime_from_ts(expires_at)} ({format_time_left(expires_at)})" if expires_at > 0 else "бессрочно"
+        bot.reply_to(
+            message,
+            f"✅ <b>Промокод создан!</b>\n\n"
+            f"<blockquote>Код: <code>{html.escape(code)}</code>\n"
+            f"Награда: <b>{format_promo_reward(ptype, pval)}</b>\n"
+            f"Лимит: <b>{lim_txt}</b>\n"
+            f"Срок: <b>{exp_txt}</b></blockquote>"
+            f"{link_line}",
+            parse_mode="HTML",
+        )
+        return
+
+    m_model = re.match(r"^(?:модель|модели|model|models)(?:\s+(.+))?$", body, flags=re.IGNORECASE)
+    if m_model:
+        clear_pending_modes(user_id)
+        arg = (m_model.group(1) or "").strip()
+        if not arg:
+            text, markup = build_model_manager_view()
+            bot.reply_to(message, text, parse_mode="HTML", reply_markup=markup)
+            return
+        if arg.lower() in ("сброс", "reset", "default"):
+            saved = set_active_models(DEFAULT_MODELS)
+            bot.reply_to(
+                message,
+                f"✅ Модель сброшена на стандартную: <code>{html.escape(', '.join(saved))}</code>",
+                parse_mode="HTML",
+            )
+            return
+        parsed = parse_models_input(arg)
+        if not parsed:
+            bot.reply_to(
+                message,
+                "⚠️ Некорректное название модели. Пример: <code>. модель gemini-3.5-flash-lite</code>",
+                parse_mode="HTML",
+            )
+            return
+        saved = set_active_models(parsed)
+        bot.reply_to(
+            message,
+            f"✅ Активная модель обновлена и сохранена:\n<code>{html.escape(', '.join(saved))}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    if low == "рассылка":
+        clear_pending_modes(user_id)
+        with _broadcast_lock:
+            _broadcast_state[user_id] = {"step": "await_content"}
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="bc_cancel"))
+        bot.reply_to(
+            message,
+            "📢 <b>Режим рассылки</b>\n\n"
+            "Отправь следующим сообщением <b>текст</b> или <b>фото с подписью</b>. "
+            "Я покажу предпросмотр с кнопкой подтверждения перед отправкой.",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return
+
+    m_grant = re.match(r"^выдать\s+премиум\s+(\S+)(?:\s+(\S+))?$", body, flags=re.IGNORECASE)
+    if m_grant:
+        target_id = resolve_target_user(m_grant.group(1))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе. Укажи ID или дождись, пока он напишет боту.")
+            return
+        dur_raw = (m_grant.group(2) or "навсегда").lower()
+        ensure_user(target_id)
+
+        if dur_raw in ("навсегда", "0", "life", "forever"):
+            with db_conn() as conn:
+                conn.cursor().execute(
+                    "UPDATE users SET is_premium = 1, pro_tier = 2, pro_until = 0 WHERE user_id = ?",
+                    (target_id,),
+                )
+            bot.reply_to(message, f"✅ Выдан <b>PRO Навсегда</b> для <code>{target_id}</code>.", parse_mode="HTML")
+            try:
+                bot.send_message(target_id, "💎 Тебе активирован <b>PRO Навсегда</b>!", parse_mode="HTML")
+            except Exception:
+                pass
+            return
+
+        if not dur_raw.isdigit() or int(dur_raw) <= 0:
+            bot.reply_to(message, "⚠️ Укажи число дней (> 0) или слово <code>навсегда</code>.", parse_mode="HTML")
+            return
+
+        days = int(dur_raw)
+        now = int(time.time())
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                "SELECT COALESCE(pro_tier, 0), COALESCE(pro_until, 0) FROM users WHERE user_id = ?",
+                (target_id,),
+            )
+            row = c.fetchone()
+            cur_tier = row[0] if row else 0
+            cur_until = row[1] if row else 0
+            if cur_tier >= 2:
+                bot.reply_to(
+                    message,
+                    f"ℹ️ У <code>{target_id}</code> уже активен <b>PRO Навсегда</b>. "
+                    "Чтобы снять его, используй <code>. забрать премиум</code>.",
+                    parse_mode="HTML",
+                )
+                return
+            base = max(now, cur_until) if cur_tier == 1 else now
+            until_ts = base + days * 86400
+            c.execute(
+                "UPDATE users SET is_premium = 1, pro_tier = 1, pro_until = ? WHERE user_id = ?",
+                (until_ts, target_id),
+            )
+        bot.reply_to(
+            message,
+            f"✅ Выдан <b>PRO на {days} дн.</b> (до {format_date_from_ts(until_ts)}) для <code>{target_id}</code>.",
+            parse_mode="HTML",
+        )
+        try:
+            bot.send_message(
+                target_id,
+                f"👑 Тебе активирован <b>PRO на {days} дн.</b> (до {format_date_from_ts(until_ts)})!",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return
+
+    m_rev = re.match(r"^забрать\s+премиум\s+(\S+)$", body, flags=re.IGNORECASE)
+    if m_rev:
+        target_id = resolve_target_user(m_rev.group(1))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        ensure_user(target_id)
+        with db_conn() as conn:
+            conn.cursor().execute(
+                "UPDATE users SET is_premium = 0, pro_tier = 0, pro_until = 0 WHERE user_id = ?",
+                (target_id,),
+            )
+        bot.reply_to(message, f"❌ PRO снят у <code>{target_id}</code>.", parse_mode="HTML")
+        return
+
+    m_scans = re.match(r"^выдать\s+сканы\s+(\S+)\s+(\d+)$", body, flags=re.IGNORECASE)
+    if m_scans:
+        target_id = resolve_target_user(m_scans.group(1))
+        amount = int(m_scans.group(2))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        if amount <= 0:
+            bot.reply_to(message, "⚠️ Количество сканов должно быть больше 0.")
+            return
+        ensure_user(target_id)
+        with db_conn() as conn:
+            conn.cursor().execute(
+                "UPDATE users SET free_limit = free_limit + ? WHERE user_id = ?",
+                (amount, target_id),
+            )
+        bot.reply_to(message, f"✅ Начислено <b>+{amount} сканов</b> юзеру <code>{target_id}</code>.", parse_mode="HTML")
+        try:
+            bot.send_message(target_id, f"⚡ Тебе начислено <b>+{amount} сканов</b> на баланс!", parse_mode="HTML")
+        except Exception:
+            pass
+        return
+
+    m_take_user = re.match(
+        r"^забрать\s+(?:сканы|рейты)\s+(\S+)\s+(\S+)$",
+        body,
+        flags=re.IGNORECASE,
+    )
+    if m_take_user:
+        target_id = resolve_target_user(m_take_user.group(1))
+        arg = m_take_user.group(2).lower()
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        ensure_user(target_id)
+        if arg in ("все", "всё", "all", "0"):
+            with db_conn() as conn:
+                conn.cursor().execute("UPDATE users SET free_limit = 0 WHERE user_id = ?", (target_id,))
+            bot.reply_to(message, f"🗑 Все сканы обнулены у <code>{target_id}</code>.", parse_mode="HTML")
+            return
+        if not arg.isdigit() or int(arg) <= 0:
+            bot.reply_to(message, "⚠️ Укажи число (> 0) или <code>все</code>.", parse_mode="HTML")
+            return
+        amount = int(arg)
+        with db_conn() as conn:
+            conn.cursor().execute(
+                "UPDATE users SET free_limit = MAX(0, free_limit - ?) WHERE user_id = ?",
+                (amount, target_id),
+            )
+        bot.reply_to(message, f"✅ Списано до <b>-{amount} сканов</b> у <code>{target_id}</code>.", parse_mode="HTML")
+        return
+
+    m_info = re.match(r"^инфо\s+(\S+)$", body, flags=re.IGNORECASE)
+    if m_info:
+        target_id = resolve_target_user(m_info.group(1))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        bot.reply_to(message, build_user_dossier_text(target_id), parse_mode="HTML")
+        return
+
+    m_ban = re.match(r"^(бан|разбан)\s+(\S+)$", body, flags=re.IGNORECASE)
+    if m_ban:
+        action = m_ban.group(1).lower()
+        target_id = resolve_target_user(m_ban.group(2))
+        if not target_id:
+            bot.reply_to(message, "⚠️ Пользователь не найден в базе.")
+            return
+        if is_admin(target_id):
+            bot.reply_to(message, "⚠️ Нельзя забанить администратора.")
+            return
+        ensure_user(target_id)
+        ban_val = 1 if action == "бан" else 0
+        with db_conn() as conn:
+            conn.cursor().execute("UPDATE users SET is_banned = ? WHERE user_id = ?", (ban_val, target_id))
+        msg = f"⛔ Пользователь <code>{target_id}</code> забанен." if ban_val else f"✅ Пользователь <code>{target_id}</code> разбанен."
+        bot.reply_to(message, msg, parse_mode="HTML")
+        return
+
+    bot.reply_to(message, "⚠️ Неизвестная команда. Напиши <code>. админ</code> для списка.", parse_mode="HTML")
+
+
+def _prepare_broadcast_preview(message):
+    user_id = message.from_user.id
+    with _broadcast_lock:
+        state = _broadcast_state.get(user_id)
+    if not state or state.get("step") != "await_content":
+        return False
+
+    if message.content_type == "photo":
+        payload = {
+            "step": "ready",
+            "type": "photo",
+            "file_id": message.photo[-1].file_id,
+            "caption": message.caption or "",
+        }
+    elif message.content_type == "text":
+        payload = {
+            "step": "ready",
+            "type": "text",
+            "text": message.text,
+        }
+    else:
+        bot.reply_to(message, "⚠️ Для рассылки отправь текст или фото с подписью.")
+        return True
+
+    with _broadcast_lock:
+        _broadcast_state[user_id] = payload
+
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(is_banned, 0) = 0")
+        total_targets = c.fetchone()[0]
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton(f"✅ Отправить ({total_targets})", callback_data="bc_send"),
+        InlineKeyboardButton("❌ Отмена", callback_data="bc_cancel"),
+    )
+
+    bot.send_message(message.chat.id, "👁 <b>Предпросмотр рассылки:</b>", parse_mode="HTML")
+    if payload["type"] == "photo":
+        bot.send_photo(message.chat.id, payload["file_id"], caption=payload["caption"], reply_markup=markup)
+    else:
+        bot.send_message(message.chat.id, payload["text"], reply_markup=markup)
+    return True
+
+
+def _send_broadcast_item(uid, payload):
+    if payload["type"] == "photo":
+        bot.send_photo(uid, payload["file_id"], caption=payload["caption"])
+    else:
+        bot.send_message(uid, payload["text"])
+
+
+def _run_broadcast_worker(admin_chat_id, payload):
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM users WHERE COALESCE(is_banned, 0) = 0")
+        user_ids = [row[0] for row in c.fetchall()]
+
+    ok_cnt, fail_cnt = 0, 0
+    for uid in user_ids:
+        sent = False
+        for attempt in range(2):
+            try:
+                _send_broadcast_item(uid, payload)
+                sent = True
+                break
+            except telebot.apihelper.ApiTelegramException as api_err:
+                if getattr(api_err, "error_code", None) == 429 and attempt == 0:
+                    retry_after = 3
+                    try:
+                        retry_after = int((api_err.result_json or {}).get("parameters", {}).get("retry_after", 3))
+                    except Exception:
+                        retry_after = 3
+                    time.sleep(min(max(1, retry_after), 60) + 0.5)
+                    continue
+                break
+            except Exception:
+                break
+        if sent:
+            ok_cnt += 1
+        else:
+            fail_cnt += 1
+        time.sleep(0.05)
+
+    try:
+        bot.send_message(
+            admin_chat_id,
+            f"📢 <b>Рассылка завершена!</b>\n"
+            f"Доставлено: <b>{ok_cnt}</b> | Ошибок/блок: <b>{fail_cnt}</b>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
+@bot.message_handler(
+    func=lambda m: is_admin(m.from_user.id) and is_awaiting_broadcast(m.from_user.id),
+    content_types=["text", "photo"],
+)
+def handle_admin_broadcast_input(message):
+    _prepare_broadcast_preview(message)
+
+
+@bot.message_handler(
+    func=lambda m: is_admin(m.from_user.id) and is_awaiting_model(m.from_user.id),
+    content_types=["text"],
+)
+def handle_admin_model_input(message):
+    user_id = message.from_user.id
+    parsed = parse_models_input(message.text)
+    if not parsed:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="model_cancel"))
+        bot.reply_to(
+            message,
+            "⚠️ Некорректное имя модели. Введи название латиницей, например:\n"
+            "<code>gemini-3.5-flash-lite</code>\n"
+            "<i>Или несколько моделей через запятую.</i>",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return
+
+    clear_awaiting_model(user_id)
+    saved = set_active_models(parsed)
+    text, markup = build_model_manager_view()
+    bot.reply_to(
+        message,
+        f"✅ Модель обновлена и сохранена: <code>{html.escape(', '.join(saved))}</code>\n\n{text}",
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
+
+
+def build_report_markup(photo_hash, include_profile_btn=True, is_profile=False):
+    markup = InlineKeyboardMarkup(row_width=2)
+    if photo_hash:
+        btn_label = "📊 Подробный разбор профиля" if is_profile else "📊 Подробный разбор"
+        markup.add(InlineKeyboardButton(btn_label, callback_data=f"full_{photo_hash}"))
+        if not is_profile:
+            markup.add(InlineKeyboardButton("📈 План роста (PRO)", callback_data=f"growth_{photo_hash}"))
+    row2 = []
+    if include_profile_btn and not is_profile:
+        row2.append(InlineKeyboardButton("📐 Профиль (PRO)", callback_data="profile_scan"))
+    row2.append(InlineKeyboardButton("📖 Шкала", callback_data="psl_scale_new"))
+    row2.append(InlineKeyboardButton("🏠 Меню", callback_data="main_menu_new"))
+    markup.add(*row2)
+    return markup
+
+
+def _run_growth_plan_worker(chat_id, user_id, photo_hash, scores_text, full_text, status_msg):
+    try:
+        report_context = f"{scores_text}\n\n{full_text}".strip()[:4500]
+        prompt = GROWTH_PLAN_PROMPT.format(report_context=report_context)
+        plan_text, _ = run_gemini_text_pipeline(prompt)
+        delete_status_safe(chat_id, status_msg)
+
+        if not plan_text:
+            bot.send_message(
+                chat_id,
+                "⏳ Не удалось сгенерировать план роста прямо сейчас — попробуй нажать кнопку через минуту.",
+            )
+            return
+
+        cache_set_growth_plan(photo_hash, plan_text)
+        send_long_html(chat_id, "📈 Персональный план роста (PRO)", plan_text)
+    except Exception as e:
+        log_error(f"Ошибка в _run_growth_plan_worker: {e}")
+        delete_status_safe(chat_id, status_msg)
+        bot.send_message(chat_id, "⏳ Технический сбой при генерации плана роста. Попробуй ещё раз.")
+    finally:
+        with _growth_busy_lock:
+            _growth_busy.discard((user_id, photo_hash))
+
+
+def _build_front_caption(scores_text, verdict="", limit_info="", delta_line=""):
+    score = extract_final_score(scores_text)
+    m_cat = re.search(r"(?im)^Категория[:\s]+(.+)$", scores_text)
+    cat = m_cat.group(1).strip() if m_cat else (category_by_score(score) if score else "")
+    head = (
+        f"<b>Результат: {score:.1f}/8 • {html.escape(cat)}</b>"
+        if score is not None
+        else "<b>Карточка анализа лица готова</b>"
+    )
+    delta_block = f"\n{html.escape(delta_line)}" if delta_line else ""
+    quote_block = f"\n<blockquote>{html.escape(verdict)}</blockquote>" if verdict else ""
+    return f"{head}{delta_block}{quote_block}{limit_info}"
+
+
+def _build_profile_caption(scores_text, verdict="", limit_info=""):
+    score = extract_final_score(scores_text)
+    m_cat = re.search(r"(?im)^Категория[:\s]+(.+)$", scores_text)
+    cat = m_cat.group(1).strip() if m_cat else (category_by_score(score) if score else "")
+    head = (
+        f"<b>📐 Профиль: {score:.1f}/8 • {html.escape(cat)}</b>"
+        if score is not None
+        else "<b>📐 Анализ бокового профиля готов</b>"
+    )
+    quote_block = f"\n<blockquote>{html.escape(verdict)}</blockquote>" if verdict else ""
+    return f"{head}{quote_block}{limit_info}"
+
+
+def _send_report_card_or_text(
+    chat_id,
+    card_bytes,
+    scores_text,
+    full_text,
+    photo_hash,
+    verdict="",
+    limit_info="",
+    delta_line="",
+    is_profile=False,
+    card_file_id="",
+):
+    markup = build_report_markup(
+        photo_hash if full_text else None,
+        include_profile_btn=not is_profile,
+        is_profile=is_profile,
+    )
+    if not verdict:
+        verdict = extract_verdict(scores_text)
+
+    caption = (
+        _build_profile_caption(scores_text, verdict=verdict, limit_info=limit_info)
+        if is_profile
+        else _build_front_caption(scores_text, verdict=verdict, limit_info=limit_info, delta_line=delta_line)
+    )
+
+    if card_file_id:
+        try:
+            bot.send_photo(chat_id, card_file_id, caption=caption, parse_mode="HTML", reply_markup=markup)
+            return card_file_id
+        except Exception as e:
+            log_error(f"Не удалось отправить карточку по file_id, пробую резерв: {e}")
+
+    if card_bytes:
+        try:
+            with io.BytesIO(card_bytes) as bio:
+                bio.name = "adonis_psl_card.jpg"
+                sent = bot.send_photo(chat_id, bio, caption=caption, parse_mode="HTML", reply_markup=markup)
+            if sent and getattr(sent, "photo", None):
+                return sent.photo[-1].file_id
+            return ""
+        except Exception as e:
+            log_error(f"Не удалось отправить карточку, шлю текстом: {e}")
+
+    title = "Анализ бокового профиля:" if is_profile else "Экспресс-оценка лица:"
+    delta_block = f"\n{html.escape(delta_line)}" if delta_line else ""
+    bot.send_message(
+        chat_id,
+        f"<b>{title}</b>{delta_block}\n\n<blockquote>{html.escape(scores_text)}</blockquote>{limit_info}",
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
+    return ""
+
+
+def _format_full_breakdown(full_text, geom=None):
+    parts = []
+    if geom and geom.get("metrics"):
+        title = "📐 Пропорции (468 точек лица):" if geom.get("source") == "mediapipe" else "📐 Пропорции лица:"
+        lines = [title]
+        for m in geom["metrics"]:
+            if m.get("display"):
+                lines.append(f"• {m['name']}: {m['display']} — {m['status']} ({m['norm']})")
+            else:
+                lines.append(f"• {m['name']}: {m['status']} ({m['norm']})")
+        lines.append(f"• Симметрия: {geom['symmetry_pct']:.1f}% — {geom['symmetry_status']}")
+        if geom.get("face_shape"):
+            lines.append(f"• Форма лица: {geom['face_shape']}")
+        parts.append("\n".join(lines))
+    if full_text:
+        parts.append(full_text.strip())
+    return "\n\n".join(parts)
+
+
+def _send_no_scans_prompt(chat_id, user_id=None):
+    has_sub_bonus = (
+        user_id is not None
+        and is_channel_bonus_enabled()
+        and not is_channel_bonus_claimed(user_id)
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    if has_sub_bonus:
+        markup.add(
+            InlineKeyboardButton(
+                f"📢 +{CHANNEL_SUB_BONUS} скан за подписку на канал",
+                callback_data="channel_bonus",
+            )
+        )
+    markup.add(InlineKeyboardButton(f"🤝 Пригласить друга (+{REFERRAL_BONUS} скан)", callback_data="get_ref"))
+    markup.add(InlineKeyboardButton("💎 Купить сканы / PRO", callback_data="buy_menu"))
+    markup.add(InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
+
+    if has_sub_bonus:
+        msg = (
+            "❌ <b>На балансе нет доступных сканов.</b>\n\n"
+            f"Подпишись на наш канал (+{CHANNEL_SUB_BONUS} бесплатный скан), "
+            f"пригласи друга (+{REFERRAL_BONUS} скан) или выбери тариф:"
+        )
+    else:
+        msg = (
+            "❌ <b>Бесплатные сканы исчерпаны.</b>\n\n"
+            f"Пригласи друга по ссылке (+{REFERRAL_BONUS} скан) или выбери тариф:"
+        )
+    bot.send_message(chat_id, msg, parse_mode="HTML", reply_markup=markup)
+
+
+def _send_pro_daily_limit_prompt(chat_id, daily_limit):
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("⚡ Докупить пакет сканов", callback_data="buy_menu"))
+    markup.add(InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
+    bot.send_message(
+        chat_id,
+        f"⏳ <b>Дневной лимит PRO исчерпан ({daily_limit}/{daily_limit}).</b>\n"
+        "Лимит обновится завтра в 00:00, либо можно докупить пакет дополнительных сканов:",
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
+
+
+def process_adult_photo(message, status_msg=None):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    free_limit, pro_tier, _, _ = get_user_access(user_id)
+    admin_user = is_admin(user_id)
+    daily_limit = get_pro_daily_limit_for_tier(pro_tier)
+
+    if not admin_user:
+        if pro_tier > 0:
+            if get_pro_remaining_today(user_id, pro_tier) <= 0 and free_limit <= 0:
+                delete_status_safe(chat_id, status_msg)
+                _send_pro_daily_limit_prompt(chat_id, daily_limit)
+                return
+        elif free_limit <= 0:
+            delete_status_safe(chat_id, status_msg)
+            _send_no_scans_prompt(chat_id, user_id=user_id)
+            return
+
+    try:
+        if not status_msg:
+            status_msg = send_status_safe(message, "⚡ Сканю пропорции лица...")
+        processed_bytes = download_and_process_photo(message)
+    except ValueError as val_err:
+        delete_status_safe(chat_id, status_msg)
+        bot.send_message(chat_id, f"⚠️ {val_err}")
+        return
+    except Exception as e:
+        delete_status_safe(chat_id, status_msg)
+        log_error(f"Ошибка скачивания фото: {e}")
+        bot.send_message(chat_id, "⏳ Не удалось скачать фото. Попробуй ещё раз.")
+        return
+
+    photo_hash = hashlib.sha256(CACHE_VERSION.encode("utf-8") + processed_bytes).hexdigest()[:32]
+    cached = cache_get(photo_hash)
+    if cached:
+        scores_text, full_text, card_bytes, card_file_id, _ = cached
+        delete_status_safe(chat_id, status_msg)
+        _send_report_card_or_text(
+            chat_id, card_bytes, scores_text, full_text, photo_hash,
+            is_profile=False, card_file_id=card_file_id,
+        )
+        return
+
+    consumed_mode = None
+    if not admin_user:
+        if pro_tier > 0:
+            if try_consume_pro_scan(user_id, daily_limit):
+                consumed_mode = "pro"
+            elif try_consume_extra_scan(user_id):
+                consumed_mode = "extra"
+            else:
+                delete_status_safe(chat_id, status_msg)
+                _send_pro_daily_limit_prompt(chat_id, daily_limit)
+                return
+        else:
+            if not try_consume_scan(user_id):
+                delete_status_safe(chat_id, status_msg)
+                _send_no_scans_prompt(chat_id, user_id=user_id)
+                return
+            consumed_mode = "free"
+
+    def refund_if_needed():
+        if consumed_mode in ("free", "extra"):
+            refund_scan(user_id)
+        elif consumed_mode == "pro":
+            refund_pro_scan(user_id)
+
+    scan_completed = False
+    try:
+        geom = analyze_face_geometry(processed_bytes)
+        prompt = build_adult_prompt(geom)
+        raw_response, api_errors = run_gemini_pipeline(processed_bytes, prompt)
+
+        if not raw_response:
+            refund_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, format_api_failure(api_errors), parse_mode="HTML")
+            return
+
+        scores_part, full_text = split_model_response(raw_response)
+        verdict = extract_verdict(scores_part)
+        if geom is None:
+            geom = extract_visual_geometry(scores_part)
+        scores_text, params_dict, final_score, category = normalize_adult_scores(scores_part)
+
+        if not scores_text:
+            refund_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, "🤔 Не удалось распознать лицо. Пришли чёткое фото анфас при хорошем свете.")
+            return
+
+        full_combined = _format_full_breakdown(full_text, geom=geom)
+        card_bytes = None
+        try:
+            card_bytes = render_front_report_card(
+                processed_bytes, params_dict or {}, final_score, category, verdict, geom,
+                bot_username=get_bot_username(),
+            )
+        except Exception as card_err:
+            log_error(f"Ошибка рендера карточки: {card_err}")
+
+        if consumed_mode == "free":
+            rem_limit, _, _, _ = get_user_access(user_id)
+            limit_info = (
+                "\n<i>Сканы закончились — пригласи друга (/ref) или пополни баланс (/buy).</i>"
+                if rem_limit == 0
+                else f"\n<i>Осталось сканов: {rem_limit}</i>"
+            )
+        elif consumed_mode == "extra":
+            rem_limit, _, _, _ = get_user_access(user_id)
+            limit_info = f"\n<i>Списан доп. скан из пакета (осталось доп.: {rem_limit})</i>"
+        elif consumed_mode == "pro":
+            pro_left = get_pro_remaining_today(user_id, pro_tier)
+            limit_info = f"\n<i>PRO-сканов на сегодня: {pro_left}/{daily_limit}</i>"
+        else:
+            limit_info = ""
+
+        delta_val = preview_score_delta(user_id, final_score)
+        delta_line = format_score_delta(delta_val)
+
+        delete_status_safe(chat_id, status_msg)
+        sent_file_id = _send_report_card_or_text(
+            chat_id, card_bytes, scores_text, full_combined, photo_hash,
+            verdict=verdict, limit_info=limit_info, delta_line=delta_line, is_profile=False,
+        )
+        scan_completed = True
+        cache_put(photo_hash, scores_text, full_combined, card_image=card_bytes, card_file_id=sent_file_id)
+        record_user_scan_stats(user_id, score=final_score)
+
+    except Exception as e:
+        log_error(f"Ошибка в process_adult_photo: {e}")
+        if not scan_completed:
+            refund_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, "⏳ Произошёл технический сбой. Попробуй ещё раз.")
+    finally:
+        gc.collect()
+
+
+def process_profile_photo(message, status_msg=None):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    def _keep_profile_markup():
+        set_awaiting_profile(user_id)
+        m = InlineKeyboardMarkup()
+        m.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_profile"))
+        return m
+
+    free_limit, pro_tier, _, _ = get_user_access(user_id)
+    admin_user = is_admin(user_id)
+    daily_limit = get_pro_daily_limit_for_tier(pro_tier)
+
+    if not admin_user:
+        if pro_tier <= 0:
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, "👑 Анализ бокового профиля доступен только с активным PRO (/buy).")
+            return
+        if get_pro_remaining_today(user_id, pro_tier) <= 0 and free_limit <= 0:
+            delete_status_safe(chat_id, status_msg)
+            _send_pro_daily_limit_prompt(chat_id, daily_limit)
+            return
+
+    try:
+        if not status_msg:
+            status_msg = send_status_safe(message, "📐 Анализирую структуру бокового профиля...")
+        processed_bytes = download_and_process_photo(message)
+    except ValueError as val_err:
+        delete_status_safe(chat_id, status_msg)
+        bot.send_message(
+            chat_id,
+            f"⚠️ {val_err}\nРежим профиля активен — отправь другое фото сбоку или нажми «Отмена».",
+            reply_markup=_keep_profile_markup(),
+        )
+        return
+    except Exception as e:
+        delete_status_safe(chat_id, status_msg)
+        log_error(f"Ошибка скачивания фото профиля: {e}")
+        bot.send_message(chat_id, "⏳ Не удалось скачать фото. Попробуй ещё раз.", reply_markup=_keep_profile_markup())
+        return
+
+    photo_hash = "p" + hashlib.sha256(PROFILE_CACHE_VERSION.encode("utf-8") + processed_bytes).hexdigest()[:31]
+    cached = cache_get(photo_hash)
+    if cached:
+        scores_text, full_text, card_bytes, card_file_id, _ = cached
+        delete_status_safe(chat_id, status_msg)
+        _send_report_card_or_text(
+            chat_id, card_bytes, scores_text, full_text, photo_hash,
+            is_profile=True, card_file_id=card_file_id,
+        )
+        return
+
+    consumed_mode = None
+    if not admin_user:
+        if try_consume_pro_scan(user_id, daily_limit):
+            consumed_mode = "pro"
+        elif try_consume_extra_scan(user_id):
+            consumed_mode = "extra"
+        else:
+            delete_status_safe(chat_id, status_msg)
+            _send_pro_daily_limit_prompt(chat_id, daily_limit)
+            return
+
+    def refund_profile_if_needed():
+        if consumed_mode == "pro":
+            refund_pro_scan(user_id)
+        elif consumed_mode == "extra":
+            refund_scan(user_id)
+
+    scan_completed = False
+    try:
+        raw_response, api_errors = run_gemini_pipeline(processed_bytes, PROFILE_RATING_PROMPT)
+        if not raw_response:
+            refund_profile_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, format_api_failure(api_errors), parse_mode="HTML", reply_markup=_keep_profile_markup())
+            return
+
+        profile_data, full_text = parse_profile_response(raw_response)
+        if not profile_data:
+            refund_profile_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(
+                chat_id,
+                "🤔 Не удалось распознать боковой профиль. Пришли чёткое фото строго сбоку (90°), чтобы была видна линия челюсти.\n\n"
+                "<i>Режим профиля остаётся активным — отправь следующее фото или нажми «Отмена».</i>",
+                parse_mode="HTML",
+                reply_markup=_keep_profile_markup(),
+            )
+            return
+
+        card_bytes = None
+        try:
+            card_bytes = render_profile_report_card(processed_bytes, profile_data, bot_username=get_bot_username())
+        except Exception as card_err:
+            log_error(f"Ошибка рендера карточки профиля: {card_err}")
+
+        if consumed_mode == "pro":
+            limit_info = f"\n<i>PRO-сканов на сегодня: {get_pro_remaining_today(user_id, pro_tier)}/{daily_limit}</i>"
+        elif consumed_mode == "extra":
+            rem_limit, _, _, _ = get_user_access(user_id)
+            limit_info = f"\n<i>Списан доп. скан из пакета (осталось доп.: {rem_limit})</i>"
+        else:
+            limit_info = ""
+
+        delete_status_safe(chat_id, status_msg)
+        sent_file_id = _send_report_card_or_text(
+            chat_id, card_bytes, profile_data["summary_text"], full_text, photo_hash,
+            verdict=profile_data.get("verdict", ""), limit_info=limit_info, is_profile=True,
+        )
+        scan_completed = True
+        cache_put(photo_hash, profile_data["summary_text"], full_text, card_image=card_bytes, card_file_id=sent_file_id)
+        record_user_scan_stats(user_id, score=None)
+
+    except Exception as e:
+        log_error(f"Ошибка в process_profile_photo: {e}")
+        if not scan_completed:
+            refund_profile_if_needed()
+            delete_status_safe(chat_id, status_msg)
+            bot.send_message(chat_id, "⏳ Произошёл технический сбой. Попробуй ещё раз.")
+    finally:
+        gc.collect()
+
+
+def scan_worker_loop():
+    while True:
+        _, _, scan_type, message, status_msg = _scan_queue.get()
+        user_id = message.from_user.id
+        try:
+            if scan_type == "profile":
+                process_profile_photo(message, status_msg=status_msg)
+            else:
+                process_adult_photo(message, status_msg=status_msg)
+        except Exception as e:
+            log_error(f"Ошибка в scan_worker_loop: {e}")
+        finally:
+            release_user(user_id)
+            _scan_queue.task_done()
+
+
+def start_scan_workers():
+    for i in range(SCAN_WORKERS):
+        threading.Thread(target=scan_worker_loop, name=f"scan-worker-{i + 1}", daemon=True).start()
+
+
+def handle_receipt_submission(message, plan_id):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    plan = PLANS.get(plan_id)
+    if not plan:
+        bot.send_message(chat_id, "⚠️ Тариф не найден. Открой /buy заново.")
+        return
+
+    ok, err_msg = check_plan_allowed(user_id, plan)
+    if not ok:
+        bot.send_message(chat_id, f"⚠️ {err_msg}")
+        return
+
+    existing_req = get_pending_payment_request_id(user_id)
+    if existing_req:
+        bot.reply_to(
+            message,
+            f"⏳ У тебя уже есть нерассмотренная заявка <b>#{existing_req}</b>.\n"
+            "Дождись проверки администратором или напиши в /paysupport.",
+            parse_mode="HTML",
+        )
+        return
+
+    pricing = get_plan_pricing(plan_id, user_id=user_id)
+    req_id = create_payment_request(
+        user_id,
+        plan_id,
+        promo_code=pricing["promo_code"],
+        rub_amount=pricing["rub"],
+    )
+    username = f"@{message.from_user.username}" if message.from_user.username else "без юзернейма"
+    full_name = html.escape(message.from_user.first_name or "Пользователь")
+    promo_note = (
+        f"\nПромокод: <code>{html.escape(pricing['promo_code'])}</code> (-{pricing['discount_pct']}%)"
+        if pricing["promo_code"]
+        else ""
+    )
+
+    caption = (
+        f"💳 <b>Чек по заявке #{req_id}</b>\n\n"
+        f"Юзер: {full_name} ({html.escape(username)})\n"
+        f"ID: <code>{user_id}</code>\n"
+        f"Тариф: <b>{html.escape(plan['title'])}</b> ({pricing['rub']} ₽){promo_note}"
+    )
+
+    admin_markup = InlineKeyboardMarkup()
+    admin_markup.add(
+        InlineKeyboardButton("✅ Выдать доступ", callback_data=f"payok_{req_id}"),
+        InlineKeyboardButton("❌ Отклонить", callback_data=f"payno_{req_id}"),
+    )
+
+    sent_any = False
+    for admin_id in ADMIN_IDS:
+        try:
+            if message.photo:
+                bot.send_photo(admin_id, message.photo[-1].file_id, caption=caption, parse_mode="HTML", reply_markup=admin_markup)
+            elif message.document:
+                bot.send_document(admin_id, message.document.file_id, caption=caption, parse_mode="HTML", reply_markup=admin_markup)
+            sent_any = True
+        except Exception as e:
+            log_error(f"Не удалось отправить чек админу {admin_id}: {e}")
+
+    if sent_any:
+        bot.reply_to(
+            message,
+            f"✅ <b>Чек по заявке #{req_id} отправлен на проверку!</b>\n"
+            f"Тариф: <b>{html.escape(plan['title'])}</b>\n"
+            "После подтверждения доступ активируется автоматически.",
+            parse_mode="HTML",
+        )
+    else:
+        bot.reply_to(message, "⚠️ Не удалось отправить чек администратору. Нажми /paysupport.")
+
+
+@bot.message_handler(content_types=["photo", "document"])
+def handle_photo(message):
+    user_id = message.from_user.id
+    touch_user(message.from_user)
+    if is_user_banned(user_id):
+        bot.send_message(message.chat.id, "⛔ Доступ к боту ограничен.")
+        return
+
+    if is_admin(user_id) and _prepare_broadcast_preview(message):
+        return
+
+    if _is_duplicate_media_group(user_id, getattr(message, "media_group_id", None)):
+        return
+
+    if not check_rate_limit(user_id, "media", min_interval=2.5, max_per_min=10):
+        bot.reply_to(message, "⏳ Слишком частые запросы. Подожди пару секунд.")
+        return
+
+    pending_plan_id, receipt_expired = pop_awaiting_receipt(user_id)
+    if receipt_expired:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("💎 Открыть тарифы", callback_data="buy_menu"))
+        bot.send_message(
+            message.chat.id,
+            "⏳ <b>Время ожидания чека истекло (30 мин).</b>\n"
+            "Чтобы отправить чек, выбери тариф заново через меню ниже — фото не отправлено на скан.",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return
+
+    if pending_plan_id:
+        if message.content_type == "document" and not is_receipt_document(message):
+            set_awaiting_receipt(user_id, pending_plan_id)
+            bot.send_message(message.chat.id, "⚠️ Пришли скриншот чека (фото или PDF-файл).")
+            return
+        handle_receipt_submission(message, pending_plan_id)
+        return
+
+    is_profile_mode, profile_expired = pop_awaiting_profile(user_id)
+    if profile_expired:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("📐 Включить режим профиля", callback_data="profile_scan"))
+        bot.send_message(
+            message.chat.id,
+            "⏳ <b>Режим анализа бокового профиля истёк (30 мин).</b>\n"
+            "Нажми кнопку ниже и отправь фото заново, чтобы оно не пошло как скан анфас.",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return
+
+    if message.content_type == "document" and not is_image_document(message):
+        if is_profile_mode:
+            set_awaiting_profile(user_id)
+        bot.send_message(message.chat.id, "Пришли фото или изображение (JPG/PNG/WEBP).")
+        return
+
+    if not acquire_user(user_id):
+        if is_profile_mode:
+            set_awaiting_profile(user_id)
+        bot.send_message(message.chat.id, "⏳ Предыдущее фото ещё обрабатывается — подожди пару секунд.")
+        return
+
+    try:
+        _, pro_tier, _, is_adult = get_user_access(user_id)
+        if not is_adult and not is_admin(user_id):
+            release_user(user_id)
+            if is_profile_mode:
+                set_awaiting_profile(user_id)
+            send_adult_confirm(message.chat.id)
+            return
+
+        if not is_admin(user_id) and pro_tier <= 0 and _scan_queue.qsize() >= MAX_SCAN_QUEUE_SIZE:
+            release_user(user_id)
+            if is_profile_mode:
+                set_awaiting_profile(user_id)
+            bot.send_message(message.chat.id, "⏳ Очередь переполнена. Попробуй отправить фото через минуту.")
+            return
+
+        scan_type = "profile" if is_profile_mode else "front"
+        front_label = "Сканю пропорции по 468 точкам" if is_mediapipe_available() else "Сканю пропорции лица"
+
+        if is_admin(user_id) or pro_tier >= 2:
+            priority = 0
+            status_text = "📐 Анализирую боковой профиль (топ-приоритет)..." if is_profile_mode else f"⚡ {front_label} (топ-приоритет)..."
+        elif pro_tier == 1:
+            priority = 1
+            status_text = "📐 Анализирую боковой профиль (PRO-приоритет)..." if is_profile_mode else f"⚡ {front_label} (PRO-приоритет)..."
+        else:
+            priority = 2
+            status_text = "⏳ Фото добавлено в очередь..." if _scan_queue.qsize() >= SCAN_WORKERS else f"⚡ {front_label}..."
+
+        status_msg = send_status_safe(message, status_text)
+        _scan_queue.put((priority, next(_scan_seq), scan_type, message, status_msg))
+    except Exception as e:
+        release_user(user_id)
+        if is_profile_mode:
+            set_awaiting_profile(user_id)
+        log_error(f"Ошибка постановки фото в очередь: {e}")
+        bot.send_message(message.chat.id, "⏳ Произошла ошибка при обработке фото. Попробуй ещё раз.")
+
+
+def check_plan_allowed(user_id, plan):
+    if plan["type"] in ("pro30", "pro_life"):
+        _, pro_tier, _, _ = get_user_access(user_id)
+        if pro_tier >= 2:
+            return False, "У тебя уже активен PRO Навсегда!"
+    return True, None
+
+
+@bot.pre_checkout_query_handler(func=lambda query: True)
+def handle_pre_checkout(pre_checkout_query):
+    user_id = pre_checkout_query.from_user.id
+    if is_user_banned(user_id):
+        bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Доступ ограничен.")
+        return
+
+    payload = pre_checkout_query.invoice_payload or ""
+    parts = payload.split(":")
+    if len(parts) in (3, 4) and parts[0] == "plan" and parts[1] in PLANS and parts[2] == str(user_id):
+        plan_id = parts[1]
+        plan = PLANS[plan_id]
+        promo_code = parts[3].strip().upper() if len(parts) == 4 else ""
+
+        if promo_code:
+            pct = validate_discount_promo_for_user(user_id, promo_code)
+            if pct <= 0:
+                bot.answer_pre_checkout_query(
+                    pre_checkout_query.id,
+                    ok=False,
+                    error_message="Промокод истёк, исчерпан или уже привязан к заявке. Открой /buy заново.",
+                )
+                return
+            expected_stars = calc_discounted_price(plan["stars"], pct)
+        else:
+            expected_stars = plan["stars"]
+
+        if pre_checkout_query.currency != "XTR" or pre_checkout_query.total_amount != expected_stars:
+            bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Сумма платежа не совпадает.")
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message=err_msg or "Тариф недоступен.")
+            return
+        bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+    else:
+        bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Тариф не найден.")
+
+
+@bot.message_handler(content_types=["successful_payment"])
+def handle_successful_payment(message):
+    sp = message.successful_payment
+    user_id = message.from_user.id
+    parts = (sp.invoice_payload or "").split(":")
+    if len(parts) not in (3, 4) or parts[0] != "plan" or parts[1] not in PLANS or parts[2] != str(user_id):
+        log_error(f"Некорректный successful_payment payload от {user_id}: {sp.invoice_payload}")
+        return
+
+    plan_id = parts[1]
+    plan = PLANS[plan_id]
+    promo_code = parts[3].strip().upper() if len(parts) == 4 else ""
+
+    if promo_code:
+        pct = get_promo_discount_value_raw(promo_code)
+        expected_stars = calc_discounted_price(plan["stars"], pct) if pct > 0 else -1
+    else:
+        expected_stars = plan["stars"]
+
+    if sp.currency != "XTR" or sp.total_amount != expected_stars:
+        log_error(
+            f"Несовпадение суммы Stars от {user_id}: {sp.total_amount} {sp.currency} != {expected_stars} XTR"
+        )
+        return
+
+    if not record_stars_payment(sp.telegram_payment_charge_id, user_id, plan_id, sp.total_amount):
+        return
+
+    if promo_code:
+        consume_discount_promo(user_id, promo_code)
+
+    apply_plan_to_user(user_id, plan_id)
+    bot.send_message(
+        message.chat.id,
+        f"✅ <b>Оплата прошла успешно!</b>\nАктивировано: <b>{html.escape(plan['title'])}</b>.",
+        parse_mode="HTML",
+    )
+
+    username = f"@{message.from_user.username}" if message.from_user.username else "без юзернейма"
+    promo_str = f" (промокод {html.escape(promo_code)})" if promo_code else ""
+    for admin_id in ADMIN_IDS:
+        try:
+            bot.send_message(
+                admin_id,
+                f"⭐ <b>Оплата Telegram Stars</b>\n"
+                f"Юзер: <code>{user_id}</code> ({html.escape(username)})\n"
+                f"Тариф: {html.escape(plan['title'])} — <b>{sp.total_amount} ⭐</b>{promo_str}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    if not call.message:
+        safe_answer(call.id)
+        return
+
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
+    is_text_msg = call.message.content_type == "text"
+    edit_id = msg_id if is_text_msg else None
+
+    touch_user(call.from_user)
+    if is_user_banned(user_id):
+        safe_answer(call.id, "Доступ ограничен.", show_alert=True)
+        return
+
+    if not check_rate_limit(user_id, "cb", min_interval=0.4, max_per_min=35):
+        safe_answer(call.id, "Не так быстро 🙂")
+        return
+
+    data = call.data or ""
+
+    if data == "confirm_18":
+        set_user_adult(user_id)
+        safe_answer(call.id, "Возраст подтверждён")
+        try:
+            bot.edit_message_text("✅ Доступ открыт. Отправь фото лица анфас для анализа.", chat_id, msg_id)
+        except Exception:
+            bot.send_message(chat_id, "✅ Доступ открыт. Отправь фото лица анфас для анализа.")
+
+    elif data == "main_menu":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_main_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "main_menu_new":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_main_menu_view(user_id)
+        bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+
+    elif data == "psl_scale":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_psl_scale_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "psl_scale_new":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_psl_scale_view()
+        bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+
+    elif data == "scan_front_tip":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text = (
+            "<b>📸 Анализ лица анфас</b>\n\n"
+            "<blockquote>• Смотри прямо в камеру без наклона головы\n"
+            "• Ровный фронтальный свет, без жёстких теней\n"
+            "• Нейтральное выражение лица, без фильтров и очков</blockquote>\n\n"
+            "Просто отправь фото прямо сюда в чат."
+        )
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("📖 Шкала PSL", callback_data="psl_scale"))
+        markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "my_profile":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_profile_cabinet_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "buy_menu":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_buy_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "enter_promo":
+        clear_pending_modes(user_id)
+        set_awaiting_promo(user_id)
+        safe_answer(call.id, "Введи промокод")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_promo"))
+        edit_or_send(
+            chat_id,
+            "🎁 <b>Активация промокода</b>\n\n"
+            "Отправь промокод следующим сообщением в чат (например: <code>ADONIS</code>).",
+            reply_markup=markup,
+            message_id=edit_id,
+        )
+
+    elif data == "cancel_promo":
+        clear_awaiting_promo(user_id)
+        safe_answer(call.id, "Отменено")
+        text, markup = build_main_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "channel_bonus":
+        clear_pending_modes(user_id)
+        if not is_channel_bonus_enabled():
+            safe_answer(call.id, "Бонус пока недоступен.", show_alert=True)
+            return
+        if is_channel_bonus_claimed(user_id):
+            safe_answer(call.id, "Ты уже получил бонус за подписку!", show_alert=True)
+            return
+        safe_answer(call.id)
+        text, markup = build_channel_bonus_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "check_sub":
+        if not is_channel_bonus_enabled():
+            safe_answer(call.id, "Канал не настроен.", show_alert=True)
+            return
+        if is_channel_bonus_claimed(user_id):
+            safe_answer(call.id, "Бонус уже получен!", show_alert=True)
+            return
+        try:
+            member = bot.get_chat_member(get_channel_chat_id(), user_id)
+            is_sub = getattr(member, "status", "") in ("member", "administrator", "creator")
+        except Exception as e:
+            log_error(f"Ошибка проверки подписки на {CHANNEL_ID}: {e}")
+            safe_answer(call.id, "Не удалось проверить подписку. Попробуй позже.", show_alert=True)
+            return
+
+        if not is_sub:
+            safe_answer(call.id, "Подписка не найдена. Сначала подпишись на канал!", show_alert=True)
+            return
+
+        if claim_channel_bonus(user_id):
+            safe_answer(call.id, f"+{CHANNEL_SUB_BONUS} скан начислен!", show_alert=True)
+            text, markup = build_main_menu_view(user_id)
+            edit_or_send(
+                chat_id,
+                f"🎉 <b>Спасибо за подписку!</b> Начислено <b>+{CHANNEL_SUB_BONUS} бесплатный скан</b>.\n\n{text}",
+                reply_markup=markup,
+                message_id=edit_id,
+            )
+        else:
+            safe_answer(call.id, "Бонус уже был выдан ранее.", show_alert=True)
+
+    elif data == "get_ref":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_ref_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "support_menu":
+        clear_pending_modes(user_id)
+        safe_answer(call.id)
+        text, markup = build_support_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "profile_scan":
+        clear_pending_modes(user_id)
+        _, pro_tier, _, _ = get_user_access(user_id)
+        if pro_tier <= 0 and not is_admin(user_id):
+            safe_answer(call.id, "Доступно в PRO")
+            markup = InlineKeyboardMarkup(row_width=1)
+            markup.add(InlineKeyboardButton("👑 Подключить PRO", callback_data="buy_menu"))
+            markup.add(InlineKeyboardButton("🤝 Получить PRO за друзей", callback_data="get_ref"))
+            markup.add(InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu"))
+            text = (
+                "<b>📐 Анализ бокового профиля (PRO)</b>\n\n"
+                "<blockquote>Структурная карточка по 6 ключевым параметрам:\n"
+                "• Проекция подбородка и максиллы\n"
+                "• Чёткость угла челюсти\n"
+                "• Шейно-подбородочный угол\n"
+                "• Профиль носа и общая гармония</blockquote>\n\n"
+                "Открывается на тарифах <b>PRO 30 дней</b> и <b>PRO Навсегда</b>."
+            )
+            edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+            return
+
+        set_awaiting_profile(user_id)
+        safe_answer(call.id, "Отправь фото в профиль")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_profile"))
+        text = (
+            "<b>📐 Режим анализа бокового профиля</b>\n\n"
+            "<blockquote>Отправь чёткое фото строго <b>сбоку (90°)</b> при хорошем свете, "
+            "чтобы была видна линия челюсти, подбородок и профиль носа.</blockquote>"
+        )
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "cancel_profile":
+        clear_awaiting_profile(user_id)
+        safe_answer(call.id, "Режим профиля отменён")
+        text, markup = build_main_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "cancel_pay":
+        clear_pending_modes(user_id)
+        safe_answer(call.id, "Оплата отменена")
+        text, markup = build_main_menu_view(user_id)
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data.startswith("plan_"):
+        clear_pending_modes(user_id)
+        plan_id = data[5:]
+        plan = PLANS.get(plan_id)
+        if not plan:
+            safe_answer(call.id, "Тариф не найден.", show_alert=True)
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            safe_answer(call.id, err_msg, show_alert=True)
+            return
+
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        safe_answer(call.id)
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton(f"⭐ Оплатить {pr['stars']} Stars (мгновенно)", callback_data=f"stars_{plan_id}"))
+        if PAYMENT_CARD:
+            markup.add(InlineKeyboardButton(f"💳 Перевод на карту (только РФ) — {pr['rub']} ₽", callback_data=f"card_{plan_id}"))
+        markup.add(InlineKeyboardButton("⬅️ К тарифам", callback_data="buy_menu"))
+
+        promo_info = (
+            f"\n🎁 Промокод <code>{html.escape(pr['promo_code'])}</code>: скидка <b>-{pr['discount_pct']}%</b> "
+            f"(<s>{pr['orig_stars']} ⭐</s> → <b>{pr['stars']} ⭐</b> | <s>{pr['orig_rub']} ₽</s> → <b>{pr['rub']} ₽</b>)"
+            if pr["promo_code"]
+            else ""
+        )
+        text = (
+            f"<b>{html.escape(plan['title'])}</b>\n\n"
+            f"<blockquote>{html.escape(plan['desc'])}{promo_info}</blockquote>\n\n"
+            "Выбери удобный способ оплаты:"
+        )
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data.startswith("stars_"):
+        clear_pending_modes(user_id)
+        plan_id = data[6:]
+        plan = PLANS.get(plan_id)
+        if not plan:
+            safe_answer(call.id, "Тариф не найден.", show_alert=True)
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            safe_answer(call.id, err_msg, show_alert=True)
+            return
+
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        inv_payload = (
+            f"plan:{plan_id}:{user_id}:{pr['promo_code']}"
+            if pr["promo_code"]
+            else f"plan:{plan_id}:{user_id}"
+        )
+        desc = (
+            f"{plan['desc']} (промокод {pr['promo_code']} -{pr['discount_pct']}%)"
+            if pr["promo_code"]
+            else plan["desc"]
+        )
+        safe_answer(call.id, "Открываю счёт...")
+        try:
+            bot.send_invoice(
+                chat_id=chat_id,
+                title=plan["title"],
+                description=desc,
+                invoice_payload=inv_payload,
+                provider_token="",
+                currency="XTR",
+                prices=[LabeledPrice(label=plan["title"], amount=pr["stars"])],
+            )
+        except Exception as e:
+            log_error(f"Ошибка выставления счёта Stars: {e}")
+            bot.send_message(chat_id, "⚠️ Не удалось создать счёт Stars. Попробуй позже или выбери карту.")
+
+    elif data.startswith("card_"):
+        clear_pending_modes(user_id)
+        plan_id = data[5:]
+        plan = PLANS.get(plan_id)
+        if not plan or not PAYMENT_CARD:
+            safe_answer(call.id, "Оплата картой временно недоступна.", show_alert=True)
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            safe_answer(call.id, err_msg, show_alert=True)
+            return
+
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        safe_answer(call.id)
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("✅ Я оплатил — отправить чек", callback_data=f"paid_{plan_id}"))
+        markup.add(InlineKeyboardButton("⬅️ К тарифам", callback_data="buy_menu"))
+
+        sum_str = (
+            f"<s>{pr['orig_rub']} ₽</s> <b>{pr['rub']} ₽</b> (промокод {html.escape(pr['promo_code'])} -{pr['discount_pct']}%)"
+            if pr["promo_code"]
+            else f"<b>{pr['rub']} ₽</b>"
+        )
+        text = (
+            f"<b>💳 Оплата картой (только РФ): {html.escape(plan['title'])}</b>\n\n"
+            f"<blockquote>Сумма: {sum_str}\n"
+            f"Банк: <b>{html.escape(PAYMENT_BANK)}</b>\n"
+            f"Карта: <code>{html.escape(PAYMENT_CARD)}</code></blockquote>\n\n"
+            "После перевода нажми кнопку ниже и отправь чек."
+        )
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data.startswith("paid_"):
+        plan_id = data[5:]
+        plan = PLANS.get(plan_id)
+        if not plan or not PAYMENT_CARD:
+            safe_answer(call.id, "Оплата картой временно недоступна.", show_alert=True)
+            return
+        ok, err_msg = check_plan_allowed(user_id, plan)
+        if not ok:
+            safe_answer(call.id, err_msg, show_alert=True)
+            return
+        existing_req = get_pending_payment_request_id(user_id)
+        if existing_req:
+            safe_answer(call.id, f"Заявка #{existing_req} ещё на проверке.", show_alert=True)
+            return
+
+        pr = get_plan_pricing(plan_id, user_id=user_id)
+        set_awaiting_receipt(user_id, plan_id)
+        safe_answer(call.id, "Отправь скриншот или PDF-чек")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_pay"))
+        text = (
+            f"📸 <b>Отправь скриншот или PDF-чек</b> об оплате "
+            f"<b>{html.escape(plan['title'])}</b> ({pr['rub']} ₽) прямо сюда в чат."
+        )
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data.startswith("payok_") or data.startswith("payno_"):
+        if not is_admin(user_id):
+            safe_answer(call.id, "Нет прав.", show_alert=True)
+            return
+        is_approve = data.startswith("payok_")
+        try:
+            req_id = int(data.split("_", 1)[1])
+        except ValueError:
+            safe_answer(call.id, "Некорректная заявка.", show_alert=True)
+            return
+
+        resolved = resolve_payment_request(req_id, "approved" if is_approve else "rejected")
+        if not resolved:
+            safe_answer(call.id, "Заявка уже обработана.", show_alert=True)
+            return
+
+        target_id, plan_id, req_promo, _ = resolved
+        plan = PLANS.get(plan_id)
+
+        if is_approve and plan:
+            if req_promo:
+                consume_discount_promo(target_id, req_promo)
+            apply_plan_to_user(target_id, plan_id)
+            safe_answer(call.id, "Доступ выдан!")
+            status_suffix = "\n\n✅ <b>Доступ выдан</b>"
+            try:
+                bot.send_message(
+                    target_id,
+                    f"✅ <b>Оплата подтверждена!</b>\nАктивировано: <b>{html.escape(plan['title'])}</b>.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        else:
+            safe_answer(call.id, "Заявка отклонена.")
+            status_suffix = "\n\n❌ <b>Отклонено</b>"
+            try:
+                bot.send_message(target_id, f"❌ Заявка на оплату #{req_id} отклонена администратором.")
+            except Exception:
+                pass
+
+        try:
+            if call.message.content_type in ("photo", "document"):
+                base_cap = call.message.html_caption or html.escape(call.message.caption or "")
+                bot.edit_message_caption(base_cap + status_suffix, chat_id, msg_id, parse_mode="HTML", reply_markup=None)
+            else:
+                base_txt = call.message.html_text or html.escape(call.message.text or "")
+                bot.edit_message_text(base_txt + status_suffix, chat_id, msg_id, parse_mode="HTML", reply_markup=None)
+        except Exception:
+            try:
+                bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
+            except Exception:
+                pass
+
+    elif data.startswith("setmodel_"):
+        if not is_admin(user_id):
+            safe_answer(call.id, "Нет прав.", show_alert=True)
+            return
+        clear_awaiting_model(user_id)
+        chosen = data[9:].strip()
+        parsed = parse_models_input(chosen)
+        if not parsed:
+            safe_answer(call.id, "Некорректная модель.", show_alert=True)
+            return
+        set_active_models(parsed)
+        safe_answer(call.id, f"Установлена {parsed[0]}")
+        text, markup = build_model_manager_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "model_custom":
+        if not is_admin(user_id):
+            safe_answer(call.id, "Нет прав.", show_alert=True)
+            return
+        clear_pending_modes(user_id)
+        set_awaiting_model(user_id)
+        safe_answer(call.id, "Отправь название модели")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="model_cancel"))
+        edit_or_send(
+            chat_id,
+            "✏️ <b>Ввод своей модели Gemini</b>\n\n"
+            "Отправь следующим сообщением точное название модели (например: "
+            "<code>gemini-3.5-flash-lite</code>) или несколько через запятую.",
+            reply_markup=markup,
+            message_id=edit_id,
+        )
+
+    elif data == "model_cancel":
+        if not is_admin(user_id):
+            safe_answer(call.id)
+            return
+        clear_awaiting_model(user_id)
+        safe_answer(call.id, "Отменено")
+        text, markup = build_model_manager_view()
+        edit_or_send(chat_id, text, reply_markup=markup, message_id=edit_id)
+
+    elif data == "model_reset_cd":
+        if not is_admin(user_id):
+            safe_answer(call.id, "Нет прав.", show_alert=True)
+            return
+        reset_model_cooldowns()
+        safe_answer(call.id, "Паузы 404/429 сброшены!", show_alert=True)
+
+    elif data == "bc_cancel":
+        if not is_admin(user_id):
+            safe_answer(call.id)
+            return
+        clear_broadcast_state(user_id)
+        safe_answer(call.id, "Рассылка отменена")
+        try:
+            bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
+        except Exception:
+            pass
+        bot.send_message(chat_id, "❌ Рассылка отменена.")
+
+    elif data == "bc_send":
+        if not is_admin(user_id):
+            safe_answer(call.id)
+            return
+        with _broadcast_lock:
+            payload = _broadcast_state.pop(user_id, None)
+        if not payload or payload.get("step") != "ready":
+            safe_answer(call.id, "Нет активного черновика.", show_alert=True)
+            return
+        safe_answer(call.id, "Запускаю рассылку...")
+        try:
+            bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
+        except Exception:
+            pass
+        bot.send_message(chat_id, "🚀 Рассылка запущена в фоне...")
+        threading.Thread(target=_run_broadcast_worker, args=(chat_id, payload), daemon=True).start()
+
+    elif data.startswith("full_"):
+        photo_hash = data[5:]
+        if not re.fullmatch(r"p?[0-9a-f]{31,32}", photo_hash):
+            safe_answer(call.id, "Некорректный идентификатор отчёта.", show_alert=True)
+            return
+        cached = cache_get(photo_hash)
+        if cached and cached[1]:
+            safe_answer(call.id, "Загружаю разбор...")
+            title = "📐 Разбор бокового профиля" if photo_hash.startswith("p") else "💬 Подробный разбор"
+            send_long_html(chat_id, title, cached[1])
+        else:
+            safe_answer(call.id, "Разбор устарел, отправь фото заново.", show_alert=True)
+
+    elif data.startswith("growth_"):
+        photo_hash = data[7:]
+        if not re.fullmatch(r"[0-9a-f]{32}", photo_hash):
+            safe_answer(call.id, "Некорректный идентификатор отчёта.", show_alert=True)
+            return
+
+        _, pro_tier, _, _ = get_user_access(user_id)
+        if pro_tier <= 0 and not is_admin(user_id):
+            safe_answer(call.id, "Доступно в PRO")
+            markup = InlineKeyboardMarkup(row_width=1)
+            markup.add(InlineKeyboardButton("👑 Подключить PRO", callback_data="buy_menu"))
+            markup.add(InlineKeyboardButton("🤝 Получить PRO за друзей", callback_data="get_ref"))
+            bot.send_message(
+                chat_id,
+                "<b>📈 Персональный план роста (PRO)</b>\n\n"
+                "<blockquote>По результатам твоего скана бот составит пошаговый план:\n"
+                "• Топ-3 зоны роста с максимальным эффектом\n"
+                "• Подбор стрижки и щетины строго под твою форму лица\n"
+                "• Чек-лист по коже, бровям, отёчности и грумингу на 30 дней</blockquote>\n\n"
+                "Открывается на тарифах <b>PRO</b> или бесплатно за 3 приглашённых друзей.",
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+            return
+
+        cached = cache_get(photo_hash)
+        if not cached:
+            safe_answer(call.id, "Отчёт устарел, отправь фото заново.", show_alert=True)
+            return
+
+        scores_text, full_text, _, _, growth_plan = cached
+        if growth_plan:
+            safe_answer(call.id, "Загружаю план роста...")
+            send_long_html(chat_id, "📈 Персональный план роста (PRO)", growth_plan)
+            return
+
+        busy_key = (user_id, photo_hash)
+        with _growth_busy_lock:
+            if busy_key in _growth_busy:
+                safe_answer(call.id, "План уже составляется, подожди пару секунд...")
+                return
+            _growth_busy.add(busy_key)
+
+        safe_answer(call.id, "Составляю персональный план...")
+        status_msg = bot.send_message(chat_id, "📈 Составляю персональный план роста по твоим метрикам...")
+        threading.Thread(
+            target=_run_growth_plan_worker,
+            args=(chat_id, user_id, photo_hash, scores_text, full_text, status_msg),
+            daemon=True,
+        ).start()
+
+    else:
+        safe_answer(call.id)
+
+
+@bot.message_handler(content_types=["text"])
+def handle_fallback_text(message):
+    user_id = message.from_user.id
+    touch_user(message.from_user)
+    if is_user_banned(user_id):
+        return
+
+    if is_awaiting_promo(user_id):
+        clear_awaiting_promo(user_id)
+        ok, ptype, msg_text = activate_promocode_for_user(user_id, message.text)
+        markup = InlineKeyboardMarkup(row_width=1)
+        if ok and ptype == "discount":
+            markup.add(InlineKeyboardButton("💎 Перейти к тарифам со скидкой", callback_data="buy_menu"))
+        elif not ok:
+            markup.add(InlineKeyboardButton("🔁 Попробовать другой код", callback_data="enter_promo"))
+        markup.add(InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
+        bot.reply_to(message, msg_text, parse_mode="HTML", reply_markup=markup)
+        return
+
+    if is_awaiting_receipt(user_id):
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_pay"))
+        bot.reply_to(
+            message,
+            "📸 Жду <b>скриншот или PDF-чек</b> об оплате. Пришли его фото/файлом или нажми «Отмена».",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+    elif is_awaiting_profile(user_id):
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_profile"))
+        bot.reply_to(
+            message,
+            "📐 Сейчас активен режим <b>бокового профиля</b>. Пришли фото сбоку (90°) или нажми «Отмена».",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+
+
+if __name__ == "__main__":
+    init_db()
+    ensure_user_columns()
+    load_active_models_from_db()
+    setup_bot_commands()
+    start_scan_workers()
+    is_mediapipe_available()
+    uname = get_bot_username()
+    print(f"🚀 Adonis PSL Bot (@{uname or 'unknown'}) запущен!")
+
+    while True:
+        try:
+            bot.infinity_polling(
+                timeout=30,
+                long_polling_timeout=25,
+                skip_pending=True,
+            )
+        except KeyboardInterrupt:
+            print("🛑 Бот остановлен вручную.")
+            break
+        except Exception as e:
+            log_error(f"Сбой polling, перезапуск через 5 сек: {e}")
             time.sleep(5)
